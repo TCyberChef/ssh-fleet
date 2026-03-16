@@ -110,6 +110,30 @@ class ConnectionPool:
                 except SSHConnectionError:
                     raise
 
+    async def read_file(self, machine: Machine, remote_path: str, max_bytes: int = 1048576) -> str:
+        """Read a remote file via SFTP."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(conn.read_remote_file, remote_path, max_bytes)
+
+    async def upload(self, machine: Machine, local_path: str, remote_path: str) -> int:
+        """Upload a local file to remote via SFTP. Returns bytes."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(conn.upload_file, local_path, remote_path)
+
+    async def download(self, machine: Machine, remote_path: str, local_path: str) -> int:
+        """Download a remote file to local via SFTP. Returns bytes."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(conn.download_file, remote_path, local_path)
+
     def cleanup_idle(self) -> int:
         """Close connections idle longer than timeout. Returns count closed."""
         now = time.time()

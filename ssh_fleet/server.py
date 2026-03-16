@@ -124,6 +124,80 @@ async def list_machines() -> str:
 
 
 @mcp_server.tool()
+async def read_file(machine: str, remote_path: str, max_bytes: int = 1048576) -> str:
+    """Read a remote file's contents via SFTP.
+
+    Args:
+        machine: Hostname of the target machine (case-insensitive)
+        remote_path: Absolute path to the file on the remote machine
+        max_bytes: Maximum bytes to read (default 1MB). Truncates with warning if exceeded.
+    """
+    m = store.get(machine)
+    if not m:
+        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+    try:
+        content = await pool.read_file(m, remote_path, max_bytes=max_bytes)
+        return content
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except FileNotFoundError:
+        return f"ERROR: File not found: {remote_path}"
+    except PermissionError:
+        return f"ERROR: Permission denied: {remote_path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def upload(machine: str, local_path: str, remote_path: str) -> str:
+    """Upload a local file to a remote machine via SFTP.
+
+    Args:
+        machine: Hostname of the target machine (case-insensitive)
+        local_path: Path to the file on your local machine
+        remote_path: Destination path on the remote machine
+    """
+    import os
+    m = store.get(machine)
+    if not m:
+        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+    if not os.path.exists(local_path):
+        return f"ERROR: Local file not found: {local_path}"
+    try:
+        size = await pool.upload(m, local_path, remote_path)
+        return f"Uploaded {local_path} to {machine}:{remote_path} ({size:,} bytes)"
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except PermissionError:
+        return f"ERROR: Permission denied writing to {remote_path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def download(machine: str, remote_path: str, local_path: str) -> str:
+    """Download a file from a remote machine via SFTP.
+
+    Args:
+        machine: Hostname of the target machine (case-insensitive)
+        remote_path: Path to the file on the remote machine
+        local_path: Destination path on your local machine
+    """
+    m = store.get(machine)
+    if not m:
+        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+    try:
+        size = await pool.download(m, remote_path, local_path)
+        return f"Downloaded {machine}:{remote_path} to {local_path} ({size:,} bytes)"
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except FileNotFoundError:
+        return f"ERROR: Remote file not found: {remote_path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
 async def add_machine(hostname: str, ip: str, username: str, password: str) -> str:
     """Register a temporary machine for this session.
 

@@ -75,7 +75,7 @@ class SSHAuthError(SSHConnectionError):
 class SSHConnection:
     """Persistent SSH connection to a single machine.
 
-    Wraps paramiko.SSHClient with connect/close/run/run_sudo.
+    Wraps paramiko.SSHClient with connect/close/run/run_sudo/sftp.
     Designed to be held in a connection pool.
     """
 
@@ -85,6 +85,7 @@ class SSHConnection:
         self.password = password
         self.timeout = timeout
         self._client: Optional[paramiko.SSHClient] = None
+        self._sftp: Optional[paramiko.SFTPClient] = None
 
     @property
     def is_connected(self) -> bool:
@@ -121,8 +122,23 @@ class SSHConnection:
         except OSError as e:
             raise SSHAuthError(f"Cannot reach {self.ip}: {e}")
 
+    @property
+    def sftp(self) -> paramiko.SFTPClient:
+        """Get or create SFTP client (lazy)."""
+        if not self.is_connected:
+            raise SSHConnectionError(f"Not connected to {self.ip}")
+        if self._sftp is None:
+            self._sftp = self._client.open_sftp()
+        return self._sftp
+
     def close(self) -> None:
-        """Close SSH connection."""
+        """Close SSH connection and SFTP."""
+        if self._sftp:
+            try:
+                self._sftp.close()
+            except Exception:
+                pass
+            self._sftp = None
         if self._client:
             try:
                 self._client.close()
@@ -167,3 +183,29 @@ class SSHConnection:
             return CommandResult(stdout="", stderr="", exit_code=-1, error="Command timed out")
         except SSHException as e:
             return CommandResult(stdout="", stderr="", exit_code=-1, error=f"SSH error: {e}")
+
+    def read_remote_file(self, remote_path: str, max_bytes: int = 1048576) -> str:
+        """Read a remote file via SFTP. Returns content as text."""
+        with self.sftp.open(remote_path, "rb") as f:
+            chunk = f.read(1024)
+            if b"\x00" in chunk:
+                raise SSHConnectionError(f"Binary file detected: {remote_path}")
+            rest = f.read(max_bytes - len(chunk))
+            data = chunk + rest
+        text = data.decode("utf-8", errors="replace")
+        if len(data) >= max_bytes:
+            text += f"\n\n[TRUNCATED at {max_bytes} bytes]"
+        return text
+
+    def upload_file(self, local_path: str, remote_path: str) -> int:
+        """Upload a local file to remote via SFTP. Returns bytes transferred."""
+        import os
+        self.sftp.put(local_path, remote_path)
+        return os.path.getsize(local_path)
+
+    def download_file(self, remote_path: str, local_path: str) -> int:
+        """Download a remote file to local via SFTP. Returns bytes transferred."""
+        import os
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+        self.sftp.get(remote_path, local_path)
+        return os.path.getsize(local_path)

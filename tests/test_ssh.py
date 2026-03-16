@@ -1,6 +1,7 @@
 """Tests for SSH connection wrapper."""
 import pytest
-from ssh_fleet.ssh import CommandResult, escape_for_shell, strip_sudo_prompt
+from unittest.mock import MagicMock, patch, mock_open
+from ssh_fleet.ssh import CommandResult, SSHConnection, SSHConnectionError, escape_for_shell, strip_sudo_prompt
 
 
 def test_command_result_success():
@@ -61,3 +62,37 @@ def test_format_output_with_error():
     r = CommandResult(stdout="", stderr="", exit_code=-1, error="Connection timed out")
     formatted = r.format()
     assert "ERROR:" in formatted
+
+
+def test_read_remote_file_binary_rejected():
+    conn = SSHConnection("1.2.3.4", "user", "pass")
+    conn._client = MagicMock()
+    mock_sftp = MagicMock()
+    mock_file = MagicMock()
+    mock_file.read.return_value = b"\x00\x01\x02binary"
+    mock_file.__enter__ = lambda s: s
+    mock_file.__exit__ = MagicMock(return_value=False)
+    mock_sftp.open.return_value = mock_file
+    conn._sftp = mock_sftp
+    conn._client.get_transport.return_value = MagicMock(is_active=lambda: True)
+
+    with pytest.raises(SSHConnectionError, match="Binary file"):
+        conn.read_remote_file("/some/binary")
+
+
+def test_read_remote_file_text():
+    conn = SSHConnection("1.2.3.4", "user", "pass")
+    conn._client = MagicMock()
+    mock_sftp = MagicMock()
+    mock_file = MagicMock()
+    content = b"hello world\nline 2"
+    mock_file.read.side_effect = [content, b""]
+    mock_file.__enter__ = lambda s: s
+    mock_file.__exit__ = MagicMock(return_value=False)
+    mock_sftp.open.return_value = mock_file
+    conn._sftp = mock_sftp
+    conn._client.get_transport.return_value = MagicMock(is_active=lambda: True)
+
+    result = conn.read_remote_file("/some/file.txt")
+    assert "hello world" in result
+    assert "line 2" in result
