@@ -198,6 +198,71 @@ async def download(machine: str, remote_path: str, local_path: str) -> str:
 
 
 @mcp_server.tool()
+async def shell_open(machine: str, sudo: bool = True) -> str:
+    """Open a persistent interactive shell on a machine.
+
+    Sudo defaults to true (root shell) since most OnWatch operations need root.
+    The shell stays open until you close it or the session ends.
+
+    Args:
+        machine: Hostname of the target machine (case-insensitive)
+        sudo: Elevate to root via sudo (default true)
+    """
+    m = store.get(machine)
+    if not m:
+        return f"ERROR: Machine '{machine}' not found."
+    try:
+        session_id = await pool.shell_open(m, sudo=sudo)
+        return f"Opened root shell on {machine}. Session ID: {session_id}\nUse shell_run with this session_id to run commands."
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def shell_run(session_id: str, command: str, timeout: int = 60) -> str:
+    """Run a command in a persistent shell session.
+
+    No sudo overhead - the shell is already elevated.
+
+    Args:
+        session_id: Session ID from shell_open
+        command: Command to run in the shell
+        timeout: Seconds before timeout (default 60)
+    """
+    try:
+        result = await pool.shell_run(session_id, command, timeout=timeout)
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def shell_close(session_id: str) -> str:
+    """Close a persistent shell session.
+
+    Args:
+        session_id: Session ID from shell_open
+    """
+    await pool.shell_close(session_id)
+    return f"Closed shell session {session_id}"
+
+
+@mcp_server.tool()
+async def shell_list() -> str:
+    """List active shell sessions with machine name and idle time."""
+    sessions = pool.shell_list()
+    if not sessions:
+        return "No active shell sessions."
+    lines = []
+    for s in sessions:
+        lines.append(
+            f"{s['session_id']:<30} {s['machine']:<16} "
+            f"age: {s['created']}s  idle: {s['idle']}s"
+        )
+    return "\n".join(lines)
+
+
+@mcp_server.tool()
 async def add_machine(hostname: str, ip: str, username: str, password: str) -> str:
     """Register a temporary machine for this session.
 

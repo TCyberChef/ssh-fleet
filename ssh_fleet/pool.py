@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Optional
 
-from ssh_fleet.ssh import SSHConnection, SSHConnectionError, SSHAuthError, CommandResult
+from ssh_fleet.ssh import SSHConnection, SSHConnectionError, SSHAuthError, CommandResult, SudoShell
 from ssh_fleet.machines import Machine
 
 logger = logging.getLogger("ssh-fleet")
@@ -34,8 +34,11 @@ class ConnectionPool:
     def __init__(self, idle_timeout: int = 300):
         self._pool: dict[str, PoolEntry] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._shells: dict[str, dict] = {}  # session_id -> {machine, shell, created, last_used}
         self._idle_timeout = idle_timeout
+        self._shell_idle_timeout = 1800  # 30 minutes
         self._cleanup_task: Optional[asyncio.Task] = None
+        self._session_counter = 0
 
     def _get_lock(self, key: str) -> asyncio.Lock:
         """Get or create a per-machine lock."""
@@ -134,10 +137,64 @@ class ConnectionPool:
             conn = await asyncio.to_thread(self._get_or_create, machine)
             return await asyncio.to_thread(conn.download_file, remote_path, local_path)
 
+    async def shell_open(self, machine: Machine, sudo: bool = True) -> str:
+        """Open a persistent shell session. Returns session ID."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            if sudo:
+                shell = SudoShell(conn._client, machine.password)
+                await asyncio.to_thread(shell.open)
+            else:
+                # Non-sudo shell not implemented yet
+                raise SSHConnectionError("Non-sudo shells not yet supported")
+
+            self._session_counter += 1
+            session_id = f"shell-{machine.hostname.lower()}-{self._session_counter}"
+            self._shells[session_id] = {
+                "machine": machine.hostname,
+                "shell": shell,
+                "created": time.time(),
+                "last_used": time.time(),
+            }
+            logger.info(f"Opened shell session {session_id} on {machine.hostname}")
+            return session_id
+
+    async def shell_run(self, session_id: str, command: str, timeout: int = 60) -> CommandResult:
+        """Run a command in a persistent shell session."""
+        entry = self._shells.get(session_id)
+        if not entry:
+            raise SSHConnectionError(f"Shell session '{session_id}' not found. Use shell_list to see active sessions.")
+        entry["last_used"] = time.time()
+        return await asyncio.to_thread(entry["shell"].run, command, timeout)
+
+    async def shell_close(self, session_id: str) -> None:
+        """Close a persistent shell session."""
+        entry = self._shells.pop(session_id, None)
+        if entry:
+            await asyncio.to_thread(entry["shell"].close)
+            logger.info(f"Closed shell session {session_id}")
+
+    def shell_list(self) -> list[dict]:
+        """List active shell sessions."""
+        now = time.time()
+        result = []
+        for sid, entry in self._shells.items():
+            result.append({
+                "session_id": sid,
+                "machine": entry["machine"],
+                "created": int(now - entry["created"]),
+                "idle": int(now - entry["last_used"]),
+            })
+        return result
+
     def cleanup_idle(self) -> int:
-        """Close connections idle longer than timeout. Returns count closed."""
+        """Close connections and shells idle longer than timeout. Returns count closed."""
         now = time.time()
         closed = 0
+
+        # Cleanup idle connections
         to_remove = []
         for key, entry in self._pool.items():
             if now - entry.last_used > self._idle_timeout:
@@ -147,6 +204,18 @@ class ConnectionPool:
         for key in to_remove:
             del self._pool[key]
             logger.info(f"Closed idle connection: {key}")
+
+        # Cleanup idle shells
+        shell_remove = []
+        for sid, entry in self._shells.items():
+            if now - entry["last_used"] > self._shell_idle_timeout:
+                entry["shell"].close()
+                shell_remove.append(sid)
+                closed += 1
+        for sid in shell_remove:
+            del self._shells[sid]
+            logger.info(f"Closed idle shell: {sid}")
+
         return closed
 
     async def start_cleanup_loop(self):

@@ -2,8 +2,10 @@
 
 Adapted from onwatch-debug/scripts/ssh_utils.py.
 """
+import random
 import re
 import socket
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -209,3 +211,152 @@ class SSHConnection:
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         self.sftp.get(remote_path, local_path)
         return os.path.getsize(local_path)
+
+
+def _strip_ansi(text: str) -> str:
+    """Strip ANSI escape codes from terminal output."""
+    return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07|\x1b\[[\?]?[0-9;]*[a-zA-Z]', '', text)
+
+
+class SudoShell:
+    """Persistent root shell via invoke_shell() + sudo su -.
+
+    Opens an interactive shell, elevates to root once, then runs
+    multiple commands without re-authenticating. Uses marker-based
+    output parsing to extract command output and exit codes.
+    """
+
+    _MARKER = "___SUDOSHELL_DONE_{}_{}___"
+
+    def __init__(self, client: paramiko.SSHClient, password: str, timeout: int = 30):
+        self.client = client
+        self.password = password
+        self.timeout = timeout
+        self.channel = None
+        self._elevated = False
+
+    def open(self) -> None:
+        """Open interactive shell and elevate to root."""
+        self.channel = self.client.invoke_shell(width=200, height=50)
+        self.channel.settimeout(self.timeout)
+
+        # Wait for initial prompt
+        self._read_until_prompt(timeout=10)
+
+        # Send sudo su -
+        self.channel.send("sudo su -\n")
+        time.sleep(0.5)
+
+        response = self._read_until_prompt(timeout=10)
+        response_clean = _strip_ansi(response).lower()
+
+        if 'password' in response_clean:
+            self.channel.send(self.password + "\n")
+            time.sleep(0.5)
+            response = self._read_until_prompt(timeout=10)
+            response_clean = _strip_ansi(response).lower()
+
+            if 'sorry' in response_clean or 'incorrect' in response_clean:
+                self.close()
+                raise SSHConnectionError("sudo authentication failed - wrong password")
+
+        self._elevated = True
+
+    def close(self) -> None:
+        """Exit root shell and close channel."""
+        if self.channel:
+            try:
+                if self._elevated:
+                    self.channel.send("exit\n")
+                    time.sleep(0.3)
+                self.channel.close()
+            except Exception:
+                pass
+            self.channel = None
+            self._elevated = False
+
+    def run(self, command: str, timeout: int = None) -> CommandResult:
+        """Execute a command in the persistent root shell."""
+        if not self.channel or not self._elevated:
+            raise SSHConnectionError("SudoShell not open")
+
+        timeout = timeout or self.timeout
+        marker = self._MARKER.format(random.randint(10000, 99999), int(time.time()))
+
+        full_cmd = f'{command}; echo "{marker}:$?"\n'
+        self.channel.send(full_cmd)
+
+        raw = self._read_until(marker, timeout=timeout)
+
+        # Parse output
+        clean = _strip_ansi(raw).replace('\r\n', '\n').replace('\r', '')
+
+        exit_code = -1
+        output_lines = []
+        lines = clean.split('\n')
+        first_line = True
+        for line in lines:
+            stripped = line.strip()
+            if first_line and command.split()[0] in stripped:
+                first_line = False
+                continue
+            first_line = False
+            if stripped.startswith(marker):
+                parts = stripped.split(marker + ':')
+                if len(parts) > 1:
+                    try:
+                        exit_code = int(parts[1].strip())
+                    except ValueError:
+                        exit_code = -1
+                break
+            output_lines.append(line)
+
+        while output_lines and not output_lines[-1].strip():
+            output_lines.pop()
+
+        stdout = '\n'.join(output_lines).strip()
+        return CommandResult(stdout=stdout, stderr='', exit_code=exit_code)
+
+    def _read_until(self, marker: str, timeout: int = None) -> str:
+        """Read until marker:N (where N is a digit) appears."""
+        timeout = timeout or self.timeout
+        self.channel.settimeout(timeout)
+        buf = ""
+        resolved_pattern = marker + ':'
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self.channel.recv_ready():
+                    chunk = self.channel.recv(4096).decode('utf-8', errors='replace')
+                    buf += chunk
+                    idx = buf.find(resolved_pattern)
+                    while idx != -1:
+                        after = buf[idx + len(resolved_pattern):]
+                        if after and after[0].isdigit():
+                            return buf
+                        idx = buf.find(resolved_pattern, idx + 1)
+                else:
+                    time.sleep(0.05)
+            except socket.timeout:
+                break
+        return buf
+
+    def _read_until_prompt(self, timeout: int = None) -> str:
+        """Read until shell prompt (# or $)."""
+        timeout = timeout or self.timeout
+        self.channel.settimeout(timeout)
+        buf = ""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                if self.channel.recv_ready():
+                    chunk = self.channel.recv(4096).decode('utf-8', errors='replace')
+                    buf += chunk
+                    stripped = _strip_ansi(buf).rstrip()
+                    if stripped.endswith('#') or stripped.endswith('$'):
+                        return buf
+                else:
+                    time.sleep(0.05)
+            except socket.timeout:
+                break
+        return buf
