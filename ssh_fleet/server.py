@@ -1,0 +1,169 @@
+"""ssh-fleet MCP server.
+
+Exposes SSH tools to Claude Code via the Model Context Protocol.
+"""
+import logging
+import sys
+from pathlib import Path
+from typing import Optional
+
+from mcp.server.fastmcp import FastMCP
+
+from ssh_fleet.machines import MachineStore
+from ssh_fleet.pool import ConnectionPool
+from ssh_fleet.ssh import SSHConnectionError
+
+# Configure logging to stderr (visible in Claude Code MCP debug)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [ssh-fleet] %(message)s",
+    stream=sys.stderr,
+)
+logger = logging.getLogger("ssh-fleet")
+
+# Global state
+store = MachineStore()
+pool = ConnectionPool(idle_timeout=300)
+mcp_server = FastMCP("ssh-fleet")
+
+# Config paths for reload
+_status_url: Optional[str] = None
+_auth_file: Optional[Path] = None
+
+
+def _load_config() -> None:
+    """Load config and populate machine store."""
+    global _status_url, _auth_file
+
+    try:
+        import yaml
+    except ImportError:
+        logger.error("pyyaml not installed")
+        return
+
+    config_path = Path.home() / ".onwatch-debug" / "config.yaml"
+    if not config_path.exists():
+        logger.warning(f"Config not found: {config_path}")
+        return
+
+    with open(config_path) as f:
+        data = yaml.safe_load(f) or {}
+
+    auth_file = data.get("auth_file", "")
+    if auth_file:
+        _auth_file = Path(auth_file).expanduser()
+        if _auth_file.exists():
+            count = store.load_from_file(_auth_file)
+            logger.info(f"Loaded {count} machines from {_auth_file}")
+        else:
+            logger.warning(f"Auth file not found: {_auth_file}")
+
+    _status_url = data.get("status_url", "")
+    if _status_url:
+        store.load_dashboard(_status_url)
+        logger.info("Dashboard metadata loaded")
+
+
+@mcp_server.tool()
+async def exec(machine: str, command: str, timeout: int = 30) -> str:
+    """Execute a shell command on a remote machine.
+
+    Args:
+        machine: Hostname of the target machine (case-insensitive)
+        command: Shell command to execute
+        timeout: Seconds before timeout (default 30)
+    """
+    m = store.get(machine)
+    if not m:
+        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+    try:
+        result = await pool.exec(m, command, timeout=timeout)
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def sudo_exec(machine: str, command: str, timeout: int = 60) -> str:
+    """Execute a shell command with sudo on a remote machine.
+
+    Uses the machine's SSH password for sudo authentication.
+
+    Args:
+        machine: Hostname of the target machine (case-insensitive)
+        command: Shell command to execute with sudo
+        timeout: Seconds before timeout (default 60)
+    """
+    m = store.get(machine)
+    if not m:
+        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+    try:
+        result = await pool.sudo_exec(m, command, timeout=timeout)
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def list_machines() -> str:
+    """List all known machines with SSH availability and dashboard metadata."""
+    machines = store.list_all()
+    if not machines:
+        return "No machines loaded. Check ~/.onwatch-debug/config.yaml"
+
+    lines = []
+    for m in machines:
+        status = "[ssh ready]" if m["ssh"] else "[no credentials]"
+        temp = " (temporary)" if m["temporary"] else ""
+        owner = f"  owner: {m['owner']}" if m.get("owner") else ""
+        lines.append(
+            f"{m['hostname']:<16} {m['ip']:<16} {m['version']:<14} "
+            f"{m['os']:<16} {m['state']:<12} {status}{temp}{owner}"
+        )
+    return "\n".join(lines)
+
+
+@mcp_server.tool()
+async def add_machine(hostname: str, ip: str, username: str, password: str) -> str:
+    """Register a temporary machine for this session.
+
+    The machine is available immediately for exec/sudo_exec.
+    It will not be persisted - gone when the session ends.
+
+    Args:
+        hostname: Name for this machine
+        ip: IP address
+        username: SSH username
+        password: SSH password
+    """
+    try:
+        store.add_temporary(hostname, ip, username, password)
+        return f"Added temporary machine '{hostname}' ({ip}). Ready for exec/sudo_exec."
+    except ValueError as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def reload_machines() -> str:
+    """Re-read ip.lst and refresh dashboard metadata.
+
+    Temporary machines are preserved.
+    """
+    count = 0
+    if _auth_file and _auth_file.exists():
+        count = store.load_from_file(_auth_file)
+
+    if _status_url:
+        store.load_dashboard(_status_url)
+
+    return f"Reloaded {count} machines from ip.lst. Dashboard metadata refreshed."
+
+
+def main():
+    """Entry point for the ssh-fleet MCP server."""
+    _load_config()
+    mcp_server.run(transport="stdio")
+
+
+if __name__ == "__main__":
+    main()
