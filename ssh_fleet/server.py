@@ -31,6 +31,25 @@ _status_url: Optional[str] = None
 _auth_file: Optional[Path] = None
 
 
+def _find_config() -> Optional[Path]:
+    """Find config file. Checks SSH_FLEET_CONFIG env, then default paths."""
+    import os
+    env_path = os.environ.get("SSH_FLEET_CONFIG")
+    if env_path:
+        p = Path(env_path).expanduser()
+        if p.exists():
+            return p
+
+    # Check default locations
+    for candidate in [
+        Path.home() / ".ssh-fleet" / "config.yaml",
+        Path.home() / ".onwatch-debug" / "config.yaml",
+    ]:
+        if candidate.exists():
+            return candidate
+    return None
+
+
 def _load_config() -> None:
     """Load config and populate machine store."""
     global _status_url, _auth_file
@@ -41,11 +60,12 @@ def _load_config() -> None:
         logger.error("pyyaml not installed")
         return
 
-    config_path = Path.home() / ".onwatch-debug" / "config.yaml"
-    if not config_path.exists():
-        logger.warning(f"Config not found: {config_path}")
+    config_path = _find_config()
+    if not config_path:
+        logger.warning("No config found. Checked ~/.ssh-fleet/config.yaml and SSH_FLEET_CONFIG env var.")
         return
 
+    logger.info(f"Using config: {config_path}")
     with open(config_path) as f:
         data = yaml.safe_load(f) or {}
 
@@ -109,7 +129,7 @@ async def list_machines() -> str:
     """List all known machines with SSH availability and dashboard metadata."""
     machines = store.list_all()
     if not machines:
-        return "No machines loaded. Check ~/.onwatch-debug/config.yaml"
+        return "No machines loaded. Check ~/.ssh-fleet/config.yaml or set SSH_FLEET_CONFIG env var."
 
     lines = []
     for m in machines:
@@ -263,28 +283,32 @@ async def shell_list() -> str:
 
 
 @mcp_server.tool()
-async def add_machine(hostname: str, ip: str, username: str, password: str) -> str:
+async def add_machine(hostname: str, ip: str, username: str,
+                      password: str = "", key_file: str = "") -> str:
     """Register a temporary machine for this session.
 
     The machine is available immediately for exec/sudo_exec.
     It will not be persisted - gone when the session ends.
+    Provide either password or key_file for authentication.
 
     Args:
         hostname: Name for this machine
         ip: IP address
         username: SSH username
-        password: SSH password
+        password: SSH password (optional if using key_file)
+        key_file: Path to SSH private key (optional if using password)
     """
     try:
-        store.add_temporary(hostname, ip, username, password)
-        return f"Added temporary machine '{hostname}' ({ip}). Ready for exec/sudo_exec."
+        store.add_temporary(hostname, ip, username, password=password, key_file=key_file)
+        auth_method = "key" if key_file else "password"
+        return f"Added temporary machine '{hostname}' ({ip}, {auth_method} auth). Ready for exec/sudo_exec."
     except ValueError as e:
         return f"ERROR: {e}"
 
 
 @mcp_server.tool()
 async def reload_machines() -> str:
-    """Re-read ip.lst and refresh dashboard metadata.
+    """Re-read hosts file and refresh dashboard metadata.
 
     Temporary machines are preserved.
     """
@@ -295,7 +319,7 @@ async def reload_machines() -> str:
     if _status_url:
         store.load_dashboard(_status_url)
 
-    return f"Reloaded {count} machines from ip.lst. Dashboard metadata refreshed."
+    return f"Reloaded {count} machines from hosts file. Dashboard metadata refreshed."
 
 
 def main():

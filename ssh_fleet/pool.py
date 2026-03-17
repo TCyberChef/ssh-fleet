@@ -63,6 +63,7 @@ class ConnectionPool:
             ip=machine.ip,
             username=machine.username,
             password=machine.password,
+            key_file=machine.key_file,
         )
         conn.connect()
         self._pool[key] = PoolEntry(conn)

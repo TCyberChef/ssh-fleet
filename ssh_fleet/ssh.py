@@ -1,7 +1,4 @@
-"""SSH connection and command execution.
-
-Adapted from onwatch-debug/scripts/ssh_utils.py.
-"""
+"""SSH connection and command execution."""
 import random
 import re
 import socket
@@ -81,10 +78,12 @@ class SSHConnection:
     Designed to be held in a connection pool.
     """
 
-    def __init__(self, ip: str, username: str, password: str, timeout: int = 10):
+    def __init__(self, ip: str, username: str, password: str = "",
+                 key_file: str = "", timeout: int = 10):
         self.ip = ip
         self.username = username
         self.password = password
+        self.key_file = key_file
         self.timeout = timeout
         self._client: Optional[paramiko.SSHClient] = None
         self._sftp: Optional[paramiko.SFTPClient] = None
@@ -103,15 +102,26 @@ class SSHConnection:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            client.connect(
-                hostname=self.ip,
-                username=self.username,
-                password=self.password,
-                timeout=self.timeout,
-                banner_timeout=self.timeout,
-                allow_agent=False,
-                look_for_keys=False,
-            )
+            connect_kwargs = {
+                "hostname": self.ip,
+                "username": self.username,
+                "timeout": self.timeout,
+                "banner_timeout": self.timeout,
+            }
+            if self.key_file:
+                connect_kwargs["key_filename"] = self.key_file
+                connect_kwargs["allow_agent"] = False
+                connect_kwargs["look_for_keys"] = False
+            elif self.password:
+                connect_kwargs["password"] = self.password
+                connect_kwargs["allow_agent"] = False
+                connect_kwargs["look_for_keys"] = False
+            else:
+                # Fall back to SSH agent / default keys
+                connect_kwargs["allow_agent"] = True
+                connect_kwargs["look_for_keys"] = True
+
+            client.connect(**connect_kwargs)
             self._client = client
         except AuthenticationException:
             raise SSHAuthError(f"Authentication failed for {self.username}@{self.ip}")

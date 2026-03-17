@@ -21,7 +21,8 @@ class Machine:
     hostname: str
     ip: str
     username: str
-    password: str
+    password: str = ""
+    key_file: str = ""  # Path to SSH private key
     temporary: bool = False
     # Dashboard metadata (optional)
     version: str = ""
@@ -31,7 +32,7 @@ class Machine:
 
     @classmethod
     def from_line(cls, line: str) -> Optional["Machine"]:
-        """Parse a machine from an ip.lst line.
+        """Parse a machine from a hosts file line.
 
         Format: hostname<TAB>IP<TAB>username:password
         """
@@ -51,7 +52,7 @@ class Machine:
 
 
 class MachineStore:
-    """Manages machine inventory from ip.lst, dashboard, and temp additions."""
+    """Manages machine inventory from hosts file, dashboard, and temp additions."""
 
     def __init__(self):
         self._machines: dict[str, Machine] = {}  # lowercase key -> Machine
@@ -60,12 +61,12 @@ class MachineStore:
         self._owners: dict[str, str] = {}  # ip -> owner string
 
     def load_from_file(self, path: Path) -> int:
-        """Load machines from an ip.lst file."""
+        """Load machines from a hosts file."""
         content = path.read_text()
         return self.load_from_string(content)
 
     def load_from_string(self, content: str) -> int:
-        """Load machines from ip.lst content. Preserves temporary machines."""
+        """Load machines from hosts file content. Preserves temporary machines."""
         self._machines.clear()
         count = 0
         for line in content.splitlines():
@@ -117,14 +118,15 @@ class MachineStore:
         key = hostname.lower()
         return self._temp_machines.get(key) or self._machines.get(key)
 
-    def add_temporary(self, hostname: str, ip: str, username: str, password: str) -> Machine:
+    def add_temporary(self, hostname: str, ip: str, username: str,
+                      password: str = "", key_file: str = "") -> Machine:
         """Add a temporary machine for this session."""
         key = hostname.lower()
         if key in self._machines or key in self._temp_machines:
             raise ValueError(f"Machine '{hostname}' already exists")
         m = Machine(
             hostname=hostname, ip=ip, username=username,
-            password=password, temporary=True
+            password=password, key_file=key_file, temporary=True
         )
         self._temp_machines[key] = m
         return m

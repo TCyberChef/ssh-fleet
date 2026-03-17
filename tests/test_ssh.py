@@ -21,7 +21,7 @@ def test_escape_for_shell_basic():
 
 
 def test_escape_for_shell_special_chars():
-    assert escape_for_shell("user1!") == "'user1!'"
+    assert escape_for_shell("p@ss!") == "'p@ss!'"
 
 
 def test_escape_for_shell_single_quotes():

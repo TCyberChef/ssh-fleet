@@ -10,7 +10,7 @@ from ssh_fleet.machines import Machine
 
 @pytest.fixture
 def machine():
-    return Machine(hostname="Ferrari", ip="10.1.25.5", username="user", password="pass")
+    return Machine(hostname="web-1", ip="192.168.1.10", username="admin", password="pass")
 
 
 @pytest_asyncio.fixture
