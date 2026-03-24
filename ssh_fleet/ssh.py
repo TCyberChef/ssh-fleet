@@ -329,6 +329,8 @@ class SudoShell:
         self._elevated = True
         # Prevent marker-wrapped commands from polluting root's bash history
         self.channel.send("unset HISTFILE\n")
+        time.sleep(0.3)
+        self._read_until_prompt(timeout=5)
 
     def close(self) -> None:
         """Exit root shell and close channel."""
