@@ -86,11 +86,15 @@ def _load_config() -> None:
 
 @mcp_server.tool()
 async def exec(machine: str, command: str, timeout: int = 30) -> str:
-    """Execute a shell command on a remote machine.
+    """Execute a command on a remote machine via SSH.
+
+    Runs in a login shell (bash -l) with full PATH. Supports multi-line scripts.
+    Each call is independent (no state between calls).
+    For repeated commands on the same machine, use shell_open + shell_run instead.
 
     Args:
         machine: Hostname of the target machine (case-insensitive)
-        command: Shell command to execute
+        command: Shell command to execute (single or multi-line)
         timeout: Seconds before timeout (default 30)
     """
     m = store.get(machine)
@@ -105,13 +109,14 @@ async def exec(machine: str, command: str, timeout: int = 30) -> str:
 
 @mcp_server.tool()
 async def sudo_exec(machine: str, command: str, timeout: int = 60) -> str:
-    """Execute a shell command with sudo on a remote machine.
+    """Execute a command with sudo on a remote machine.
 
-    Uses the machine's SSH password for sudo authentication.
+    Runs in a login shell (bash -l) with full PATH. Uses the machine's SSH password for sudo.
+    Each call is independent. For multiple sudo commands, use shell_open + shell_run instead.
 
     Args:
         machine: Hostname of the target machine (case-insensitive)
-        command: Shell command to execute with sudo
+        command: Shell command to execute with sudo (single or multi-line)
         timeout: Seconds before timeout (default 60)
     """
     m = store.get(machine)
@@ -242,11 +247,12 @@ async def shell_open(machine: str, sudo: bool = True) -> str:
 async def shell_run(session_id: str, command: str, timeout: int = 60) -> str:
     """Run a command in a persistent shell session.
 
-    No sudo overhead - the shell is already elevated.
+    The shell is already elevated to root. State (cd, env vars) persists
+    between calls. Supports multi-line commands and scripts.
 
     Args:
         session_id: Session ID from shell_open
-        command: Command to run in the shell
+        command: Command to run (single or multi-line)
         timeout: Seconds before timeout (default 60)
     """
     try:

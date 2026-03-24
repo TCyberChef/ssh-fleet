@@ -39,6 +39,7 @@ class ConnectionPool:
         self._shell_idle_timeout = 1800  # 30 minutes
         self._cleanup_task: Optional[asyncio.Task] = None
         self._session_counter = 0
+        self._cleanup_started = False
 
     def _get_lock(self, key: str) -> asyncio.Lock:
         """Get or create a per-machine lock."""
@@ -70,8 +71,25 @@ class ConnectionPool:
         logger.info(f"Connected to {machine.hostname} ({machine.ip})")
         return conn
 
+    def _ensure_cleanup(self):
+        """Start the background cleanup loop if not already running."""
+        if not self._cleanup_started:
+            self._cleanup_started = True
+            try:
+                asyncio.get_running_loop()
+                self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+            except RuntimeError:
+                pass  # No event loop yet, skip
+
+    async def _cleanup_loop(self):
+        """Background loop that cleans up idle connections and shells."""
+        while True:
+            await asyncio.sleep(60)
+            self.cleanup_idle()
+
     async def exec(self, machine: Machine, command: str, timeout: int = 30) -> CommandResult:
         """Execute a command on a machine, using pooled connection."""
+        self._ensure_cleanup()
         key = machine.hostname.lower()
         lock = self._get_lock(key)
 
@@ -168,7 +186,22 @@ class ConnectionPool:
         if not entry:
             raise SSHConnectionError(f"Shell session '{session_id}' not found. Use shell_list to see active sessions.")
         entry["last_used"] = time.time()
-        return await asyncio.to_thread(entry["shell"].run, command, timeout)
+        try:
+            return await asyncio.to_thread(entry["shell"].run, command, timeout)
+        except Exception as e:
+            err = str(e).lower()
+            if any(x in err for x in ["socket is closed", "not open", "eof", "channel closed"]):
+                machine = entry["machine"]
+                self._shells.pop(session_id, None)
+                try:
+                    entry["shell"].close()
+                except Exception:
+                    pass
+                raise SSHConnectionError(
+                    f"Shell '{session_id}' died (connection lost). "
+                    f"Use shell_open on {machine} to start a new session."
+                )
+            raise
 
     async def shell_close(self, session_id: str) -> None:
         """Close a persistent shell session."""
@@ -220,12 +253,8 @@ class ConnectionPool:
         return closed
 
     async def start_cleanup_loop(self):
-        """Start background idle cleanup task."""
-        async def _loop():
-            while True:
-                await asyncio.sleep(60)
-                self.cleanup_idle()  # run on event loop, not in thread - it's fast
-        self._cleanup_task = asyncio.create_task(_loop())
+        """Start background idle cleanup task. Called automatically on first use."""
+        self._ensure_cleanup()
 
     async def close_all(self):
         """Close all connections and stop cleanup."""

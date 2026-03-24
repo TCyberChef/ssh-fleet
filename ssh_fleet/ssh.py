@@ -1,6 +1,9 @@
 """SSH connection and command execution."""
+import base64
+import json as _json
 import random
 import re
+import shlex
 import socket
 import time
 from dataclasses import dataclass
@@ -27,16 +30,62 @@ class CommandResult:
         """Return stdout, or stderr if stdout is empty."""
         return self.stdout or self.stderr
 
-    def format(self) -> str:
-        """Format for MCP tool output."""
+    def format(self, max_output: int = 50000) -> str:
+        """Format for MCP tool output.
+
+        Auto-detects and pretty-prints JSON in stdout for LLM readability.
+        Truncates output exceeding max_output characters.
+        """
         if self.error:
             return f"ERROR: {self.error}"
         parts = [f"[exit_code: {self.exit_code}]"]
         if self.stdout:
-            parts.append(self.stdout)
+            formatted = _format_output(self.stdout, max_output)
+            parts.append(formatted)
         if self.stderr:
             parts.append(f"STDERR: {self.stderr}")
         return "\n".join(parts)
+
+
+def _format_output(text: str, max_chars: int = 50000) -> str:
+    """Format command output for LLM consumption.
+
+    Auto-detects and pretty-prints JSON (whole output or per-line).
+    Truncates output exceeding max_chars.
+    """
+    stripped = text.strip()
+
+    # Try whole output as JSON first
+    if stripped.startswith('{') or stripped.startswith('['):
+        try:
+            parsed = _json.loads(stripped)
+            text = _json.dumps(parsed, indent=2, ensure_ascii=False)
+            if len(text) > max_chars:
+                text = text[:max_chars] + f"\n\n[truncated at {max_chars} chars]"
+            return text
+        except (ValueError, _json.JSONDecodeError):
+            pass
+
+    # Per-line: pretty-print lines that look like complete JSON objects/arrays
+    lines = text.split('\n')
+    result = []
+    for line in lines:
+        s = line.strip()
+        if (len(s) > 80
+                and ((s.startswith('{') and s.endswith('}'))
+                     or (s.startswith('[') and s.endswith(']')))):
+            try:
+                parsed = _json.loads(s)
+                result.append(_json.dumps(parsed, indent=2, ensure_ascii=False))
+                continue
+            except (ValueError, _json.JSONDecodeError):
+                pass
+        result.append(line)
+
+    text = '\n'.join(result)
+    if len(text) > max_chars:
+        text = text[:max_chars] + f"\n\n[truncated at {max_chars} chars]"
+    return text
 
 
 def escape_for_shell(value: str) -> str:
@@ -97,7 +146,7 @@ class SSHConnection:
         return transport is not None and transport.is_active()
 
     def connect(self) -> None:
-        """Open SSH connection."""
+        """Open SSH connection with keepalives enabled."""
         self.close()
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -122,6 +171,10 @@ class SSHConnection:
                 connect_kwargs["look_for_keys"] = True
 
             client.connect(**connect_kwargs)
+            # Enable SSH keepalives - detects dead connections within ~60s
+            transport = client.get_transport()
+            if transport:
+                transport.set_keepalive(30)
             self._client = client
         except AuthenticationException:
             raise SSHAuthError(f"Authentication failed for {self.username}@{self.ip}")
@@ -159,12 +212,13 @@ class SSHConnection:
             self._client = None
 
     def run(self, command: str, timeout: int = 30) -> CommandResult:
-        """Execute a command."""
+        """Execute a command in a login shell for full PATH."""
         if not self.is_connected:
             raise SSHConnectionError(f"Not connected to {self.ip}")
         try:
+            full_cmd = f"bash -l -c {shlex.quote(command)}"
             stdin, stdout, stderr = self._client.exec_command(
-                command, timeout=timeout, get_pty=False
+                full_cmd, timeout=timeout, get_pty=False
             )
             out = stdout.read().decode("utf-8", errors="replace").strip()
             err = stderr.read().decode("utf-8", errors="replace").strip()
@@ -176,11 +230,12 @@ class SSHConnection:
             return CommandResult(stdout="", stderr="", exit_code=-1, error=f"SSH error: {e}")
 
     def run_sudo(self, command: str, timeout: int = 60) -> CommandResult:
-        """Execute a command with sudo via echo-pipe method."""
+        """Execute a command with sudo in a login shell."""
         if not self.is_connected:
             raise SSHConnectionError(f"Not connected to {self.ip}")
         escaped_pw = escape_for_shell(self.password)
-        sudo_cmd = f"echo {escaped_pw} | sudo -Si {command}"
+        cmd_quoted = shlex.quote(command)
+        sudo_cmd = f"echo {escaped_pw} | sudo -Si bash -l -c {cmd_quoted}"
         try:
             stdin, stdout, stderr = self._client.exec_command(
                 sudo_cmd, timeout=timeout, get_pty=True
@@ -237,6 +292,7 @@ class SudoShell:
     """
 
     _MARKER = "___SUDOSHELL_DONE_{}_{}___"
+    _START = "___SUDOSHELL_START_{}_{}___"
 
     def __init__(self, client: paramiko.SSHClient, password: str, timeout: int = 30):
         self.client = client
@@ -271,6 +327,8 @@ class SudoShell:
                 raise SSHConnectionError("sudo authentication failed - wrong password")
 
         self._elevated = True
+        # Prevent marker-wrapped commands from polluting root's bash history
+        self.channel.send("unset HISTFILE\n")
 
     def close(self) -> None:
         """Exit root shell and close channel."""
@@ -286,31 +344,45 @@ class SudoShell:
             self._elevated = False
 
     def run(self, command: str, timeout: int = None) -> CommandResult:
-        """Execute a command in the persistent root shell."""
+        """Execute a command in the persistent root shell.
+
+        Multi-line commands are base64-encoded to avoid interactive shell
+        quoting issues. Output is parsed using start/end markers for
+        reliable separation from echoed input.
+        """
         if not self.channel or not self._elevated:
             raise SSHConnectionError("SudoShell not open")
 
         timeout = timeout or self.timeout
-        marker = self._MARKER.format(random.randint(10000, 99999), int(time.time()))
+        rand_id = random.randint(10000, 99999)
+        ts = int(time.time())
+        marker = self._MARKER.format(rand_id, ts)
+        start_marker = self._START.format(rand_id, ts)
 
-        full_cmd = f'{command}; echo "{marker}:$?"\n'
+        # For multi-line commands, base64 encode to avoid quoting issues
+        if '\n' in command:
+            encoded = base64.b64encode(command.encode()).decode()
+            shell_cmd = f'echo {encoded} | base64 -d | bash'
+        else:
+            shell_cmd = command
+
+        full_cmd = f'echo {start_marker}; {shell_cmd}; echo "{marker}:$?"\n'
         self.channel.send(full_cmd)
 
         raw = self._read_until(marker, timeout=timeout)
 
-        # Parse output
+        # Parse output using start/end markers
         clean = _strip_ansi(raw).replace('\r\n', '\n').replace('\r', '')
 
         exit_code = -1
         output_lines = []
-        lines = clean.split('\n')
-        first_line = True
-        for line in lines:
+        started = False
+        for line in clean.split('\n'):
             stripped = line.strip()
-            if first_line and command.split()[0] in stripped:
-                first_line = False
+            if not started:
+                if stripped == start_marker:
+                    started = True
                 continue
-            first_line = False
             if stripped.startswith(marker):
                 parts = stripped.split(marker + ':')
                 if len(parts) > 1:

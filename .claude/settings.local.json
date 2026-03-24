@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(source .venv/bin/activate)",
+      "Bash(pytest tests/ -v)",
+      "mcp__ssh-fleet__list_machines",
+      "mcp__ssh-fleet__sudo_exec",
+      "Bash(git add:*)"
+    ]
+  }
+}
