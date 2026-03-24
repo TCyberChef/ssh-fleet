@@ -311,14 +311,14 @@ class SudoShell:
 
         # Send sudo su -
         self.channel.send("sudo su -\n")
-        time.sleep(0.5)
+        time.sleep(0.15)
 
         response = self._read_until_prompt(timeout=10)
         response_clean = _strip_ansi(response).lower()
 
         if 'password' in response_clean:
             self.channel.send(self.password + "\n")
-            time.sleep(0.5)
+            time.sleep(0.15)
             response = self._read_until_prompt(timeout=10)
             response_clean = _strip_ansi(response).lower()
 
@@ -329,7 +329,7 @@ class SudoShell:
         self._elevated = True
         # Prevent marker-wrapped commands from polluting root's bash history
         self.channel.send("unset HISTFILE\n")
-        time.sleep(0.3)
+        time.sleep(0.1)
         self._read_until_prompt(timeout=5)
 
     def close(self) -> None:
