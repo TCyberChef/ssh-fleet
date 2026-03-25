@@ -24,7 +24,17 @@ logger = logging.getLogger("ssh-fleet")
 # Global state
 store = MachineStore()
 pool = ConnectionPool(idle_timeout=300)
-mcp_server = FastMCP("ssh-fleet")
+mcp_server = FastMCP(
+    "ssh-fleet",
+    instructions=(
+        "SSH access to a fleet of remote machines. Use for running commands"
+        " (exec, sudo_exec), persistent root shells (shell_open/run/close),"
+        " file operations (read_file, upload, download), and machine inventory"
+        " (list_machines, add_machine, reload_machines). Preferred method for"
+        " all ad-hoc SSH to lab machines, Proxmox hosts, or any server in the"
+        " hosts file."
+    ),
+)
 
 # Config paths for reload
 _status_url: Optional[str] = None
