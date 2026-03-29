@@ -34,7 +34,7 @@ Four modules in `ssh_fleet/`:
   - `SSHConnection.run()` / `run_sudo()` - wraps commands in `bash -l -c` (login shell) via `shlex.quote` for full PATH and multi-line safety. Each call is a separate SSH channel.
   - `SudoShell` - uses `invoke_shell()` for persistent interactive shell. Elevates to root once via `sudo su -`. Uses start/end marker pairs for reliable output parsing. Multi-line commands are base64-encoded to avoid interactive shell quoting issues.
 - **`pool.py`** - Connection pool with per-machine asyncio locks, idle cleanup (runs every 60s), and shell session management. Bridges sync paramiko calls to async via `asyncio.to_thread()`. Dead shells are auto-cleaned with actionable error messages.
-- **`machines.py`** - Machine inventory from hosts file (tab-separated), optional dashboard metadata enrichment, and temporary (session-only) machine registration.
+- **`machines.py`** - Machine inventory from hosts file (tab-separated), optional dashboard metadata enrichment, temporary (session-only) and permanent machine registration. Lookup by hostname or IP address.
 
 ### exec vs shell: Key Difference
 
@@ -58,7 +58,11 @@ Four modules in `ssh_fleet/`:
 
 ### Output Formatting
 
-`CommandResult.format()` auto-detects and pretty-prints JSON in stdout for LLM readability. Works on both pure JSON output and mixed text+JSON (per-line detection for lines >80 chars that look like complete JSON objects). Output is truncated at 50K chars.
+`CommandResult.format()` auto-detects and pretty-prints JSON in stdout for LLM readability. Works on both pure JSON output and mixed text+JSON (per-line detection for lines >80 chars that look like complete JSON objects). Output is truncated at 50K chars. Failed commands with no output show `(no output)` hint.
+
+### Tool Parameters
+
+All tools that target a machine use a `host` parameter (not `machine`). Accepts hostname or IP address, case-insensitive. The `add_host` tool supports both temporary (session-only) and permanent (appended to hosts file) machine registration.
 
 ## Testing
 

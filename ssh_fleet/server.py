@@ -30,9 +30,10 @@ mcp_server = FastMCP(
         "SSH access to a fleet of remote machines. Use for running commands"
         " (exec, sudo_exec), persistent root shells (shell_open/run/close),"
         " file operations (read_file, upload, download), and machine inventory"
-        " (list_machines, add_machine, reload_machines). Preferred method for"
-        " all ad-hoc SSH to lab machines, Proxmox hosts, or any server in the"
-        " hosts file."
+        " (list_machines, add_host, reload_machines)."
+        " The 'host' parameter accepts hostname OR IP address."
+        " IMPORTANT: Use sudo_exec (not exec) for kubectl, systemctl, and"
+        " most system commands - regular users typically lack permissions."
     ),
 )
 
@@ -95,21 +96,24 @@ def _load_config() -> None:
 
 
 @mcp_server.tool()
-async def exec(machine: str, command: str, timeout: int = 30) -> str:
-    """Execute a command on a remote machine via SSH.
+async def exec(host: str, command: str, timeout: int = 30) -> str:
+    """Execute a command as the SSH user (non-root) on a remote machine.
 
     Runs in a login shell (bash -l) with full PATH. Supports multi-line scripts.
     Each call is independent (no state between calls).
     For repeated commands on the same machine, use shell_open + shell_run instead.
 
+    NOTE: Most system commands (kubectl, systemctl, journalctl, crictl) require
+    root. Use sudo_exec instead for those.
+
     Args:
-        machine: Hostname of the target machine (case-insensitive)
+        host: Hostname or IP of the target machine (case-insensitive)
         command: Shell command to execute (single or multi-line)
         timeout: Seconds before timeout (default 30)
     """
-    m = store.get(machine)
+    m = store.get(host)
     if not m:
-        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+        return f"ERROR: Machine '{host}' not found. Use list_machines to see available machines."
     try:
         result = await pool.exec(m, command, timeout=timeout)
         return result.format()
@@ -118,20 +122,23 @@ async def exec(machine: str, command: str, timeout: int = 30) -> str:
 
 
 @mcp_server.tool()
-async def sudo_exec(machine: str, command: str, timeout: int = 60) -> str:
-    """Execute a command with sudo on a remote machine.
+async def sudo_exec(host: str, command: str, timeout: int = 60) -> str:
+    """Execute a command as root on a remote machine. Preferred for most operations.
 
     Runs in a login shell (bash -l) with full PATH. Uses the machine's SSH password for sudo.
-    Each call is independent. For multiple sudo commands, use shell_open + shell_run instead.
+    Each call is independent. For multiple commands, use shell_open + shell_run instead.
+
+    Use this for: kubectl, systemctl, journalctl, crictl, docker/podman, file reads
+    outside the SSH user's home, and any system administration commands.
 
     Args:
-        machine: Hostname of the target machine (case-insensitive)
+        host: Hostname or IP of the target machine (case-insensitive)
         command: Shell command to execute with sudo (single or multi-line)
         timeout: Seconds before timeout (default 60)
     """
-    m = store.get(machine)
+    m = store.get(host)
     if not m:
-        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+        return f"ERROR: Machine '{host}' not found. Use list_machines to see available machines."
     try:
         result = await pool.sudo_exec(m, command, timeout=timeout)
         return result.format()
@@ -159,17 +166,17 @@ async def list_machines() -> str:
 
 
 @mcp_server.tool()
-async def read_file(machine: str, remote_path: str, max_bytes: int = 1048576) -> str:
+async def read_file(host: str, remote_path: str, max_bytes: int = 1048576) -> str:
     """Read a remote file's contents via SFTP.
 
     Args:
-        machine: Hostname of the target machine (case-insensitive)
+        host: Hostname or IP of the target machine (case-insensitive)
         remote_path: Absolute path to the file on the remote machine
         max_bytes: Maximum bytes to read (default 1MB). Truncates with warning if exceeded.
     """
-    m = store.get(machine)
+    m = store.get(host)
     if not m:
-        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+        return f"ERROR: Machine '{host}' not found. Use list_machines to see available machines."
     try:
         content = await pool.read_file(m, remote_path, max_bytes=max_bytes)
         return content
@@ -184,23 +191,23 @@ async def read_file(machine: str, remote_path: str, max_bytes: int = 1048576) ->
 
 
 @mcp_server.tool()
-async def upload(machine: str, local_path: str, remote_path: str) -> str:
+async def upload(host: str, local_path: str, remote_path: str) -> str:
     """Upload a local file to a remote machine via SFTP.
 
     Args:
-        machine: Hostname of the target machine (case-insensitive)
+        host: Hostname or IP of the target machine (case-insensitive)
         local_path: Path to the file on your local machine
         remote_path: Destination path on the remote machine
     """
     import os
-    m = store.get(machine)
+    m = store.get(host)
     if not m:
-        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+        return f"ERROR: Machine '{host}' not found. Use list_machines to see available machines."
     if not os.path.exists(local_path):
         return f"ERROR: Local file not found: {local_path}"
     try:
         size = await pool.upload(m, local_path, remote_path)
-        return f"Uploaded {local_path} to {machine}:{remote_path} ({size:,} bytes)"
+        return f"Uploaded {local_path} to {host}:{remote_path} ({size:,} bytes)"
     except SSHConnectionError as e:
         return f"ERROR: {e}"
     except PermissionError:
@@ -210,20 +217,20 @@ async def upload(machine: str, local_path: str, remote_path: str) -> str:
 
 
 @mcp_server.tool()
-async def download(machine: str, remote_path: str, local_path: str) -> str:
+async def download(host: str, remote_path: str, local_path: str) -> str:
     """Download a file from a remote machine via SFTP.
 
     Args:
-        machine: Hostname of the target machine (case-insensitive)
+        host: Hostname or IP of the target machine (case-insensitive)
         remote_path: Path to the file on the remote machine
         local_path: Destination path on your local machine
     """
-    m = store.get(machine)
+    m = store.get(host)
     if not m:
-        return f"ERROR: Machine '{machine}' not found. Use list_machines to see available machines."
+        return f"ERROR: Machine '{host}' not found. Use list_machines to see available machines."
     try:
         size = await pool.download(m, remote_path, local_path)
-        return f"Downloaded {machine}:{remote_path} to {local_path} ({size:,} bytes)"
+        return f"Downloaded {host}:{remote_path} to {local_path} ({size:,} bytes)"
     except SSHConnectionError as e:
         return f"ERROR: {e}"
     except FileNotFoundError:
@@ -233,22 +240,22 @@ async def download(machine: str, remote_path: str, local_path: str) -> str:
 
 
 @mcp_server.tool()
-async def shell_open(machine: str, sudo: bool = True) -> str:
+async def shell_open(host: str, sudo: bool = True) -> str:
     """Open a persistent interactive shell on a machine.
 
-    Sudo defaults to true (root shell) since most OnWatch operations need root.
+    Sudo defaults to true (root shell) since most operations need root.
     The shell stays open until you close it or the session ends.
 
     Args:
-        machine: Hostname of the target machine (case-insensitive)
+        host: Hostname or IP of the target machine (case-insensitive)
         sudo: Elevate to root via sudo (default true)
     """
-    m = store.get(machine)
+    m = store.get(host)
     if not m:
-        return f"ERROR: Machine '{machine}' not found."
+        return f"ERROR: Machine '{host}' not found."
     try:
         session_id = await pool.shell_open(m, sudo=sudo)
-        return f"Opened root shell on {machine}. Session ID: {session_id}\nUse shell_run with this session_id to run commands."
+        return f"Opened root shell on {host}. Session ID: {session_id}\nUse shell_run with this session_id to run commands."
     except SSHConnectionError as e:
         return f"ERROR: {e}"
 
@@ -299,25 +306,33 @@ async def shell_list() -> str:
 
 
 @mcp_server.tool()
-async def add_machine(hostname: str, ip: str, username: str,
-                      password: str = "", key_file: str = "") -> str:
-    """Register a temporary machine for this session.
+async def add_host(hostname: str, ip: str, username: str,
+                   password: str = "", key_file: str = "",
+                   permanent: bool = False) -> str:
+    """Add a machine to the fleet. Permanent saves to the hosts file for future sessions.
 
     The machine is available immediately for exec/sudo_exec.
-    It will not be persisted - gone when the session ends.
-    Provide either password or key_file for authentication.
+    With permanent=False (default), it's session-only and gone when the session ends.
+    With permanent=True, it's appended to the hosts file and persists across sessions.
 
     Args:
         hostname: Name for this machine
         ip: IP address
         username: SSH username
-        password: SSH password (optional if using key_file)
-        key_file: Path to SSH private key (optional if using password)
+        password: SSH password (required for permanent; optional if using key_file for temp)
+        key_file: Path to SSH private key (only for temporary machines)
+        permanent: Save to hosts file for future sessions (default false)
     """
     try:
-        store.add_temporary(hostname, ip, username, password=password, key_file=key_file)
-        auth_method = "key" if key_file else "password"
-        return f"Added temporary machine '{hostname}' ({ip}, {auth_method} auth). Ready for exec/sudo_exec."
+        if permanent:
+            m = store.add_permanent(
+                hostname, ip, username, password=password, auth_file=_auth_file
+            )
+            return f"Added '{hostname}' ({ip}) permanently to {_auth_file}. Ready for exec/sudo_exec."
+        else:
+            store.add_temporary(hostname, ip, username, password=password, key_file=key_file)
+            auth_method = "key" if key_file else "password"
+            return f"Added temporary machine '{hostname}' ({ip}, {auth_method} auth). Ready for exec/sudo_exec."
     except ValueError as e:
         return f"ERROR: {e}"
 

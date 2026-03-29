@@ -85,6 +85,67 @@ def test_store_unknown_machine():
     assert store.get("nonexistent") is None
 
 
+def test_store_lookup_by_ip():
+    store = MachineStore()
+    store.load_from_string("web-1\t192.168.1.10\tadmin:pass\n")
+    m = store.get("192.168.1.10")
+    assert m is not None
+    assert m.hostname == "web-1"
+
+
+def test_store_lookup_by_ip_temporary():
+    store = MachineStore()
+    store.add_temporary("staging", "10.0.0.5", "deploy", "secret")
+    m = store.get("10.0.0.5")
+    assert m is not None
+    assert m.hostname == "staging"
+    assert m.temporary is True
+
+
+def test_store_lookup_by_ip_unknown():
+    store = MachineStore()
+    store.load_from_string("web-1\t192.168.1.10\tadmin:pass\n")
+    assert store.get("10.99.99.99") is None
+
+
+def test_store_add_permanent(tmp_path):
+    auth_file = tmp_path / "hosts.txt"
+    auth_file.write_text("web-1\t192.168.1.10\tadmin:pass\n")
+    store = MachineStore()
+    store.load_from_file(auth_file)
+    m = store.add_permanent("db-1", "192.168.1.20", "admin", password="secret", auth_file=auth_file)
+    assert m.hostname == "db-1"
+    assert m.temporary is False
+    # Verify written to file
+    content = auth_file.read_text()
+    assert "db-1\t192.168.1.20\tadmin:secret" in content
+    # Verify in store
+    assert store.get("db-1") is not None
+
+
+def test_store_add_permanent_duplicate_rejected(tmp_path):
+    auth_file = tmp_path / "hosts.txt"
+    auth_file.write_text("web-1\t192.168.1.10\tadmin:pass\n")
+    store = MachineStore()
+    store.load_from_file(auth_file)
+    with pytest.raises(ValueError, match="already exists"):
+        store.add_permanent("web-1", "192.168.1.20", "admin", password="x", auth_file=auth_file)
+
+
+def test_store_add_permanent_no_auth_file():
+    store = MachineStore()
+    with pytest.raises(ValueError, match="No auth_file"):
+        store.add_permanent("db-1", "192.168.1.20", "admin", password="x")
+
+
+def test_store_add_permanent_no_password(tmp_path):
+    auth_file = tmp_path / "hosts.txt"
+    auth_file.write_text("")
+    store = MachineStore()
+    with pytest.raises(ValueError, match="require a password"):
+        store.add_permanent("db-1", "192.168.1.20", "admin", auth_file=auth_file)
+
+
 def test_store_list_all_includes_ssh_info():
     store = MachineStore()
     store.load_from_string("web-1\t192.168.1.10\tadmin:pass\n")

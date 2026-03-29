@@ -113,10 +113,21 @@ class MachineStore:
         except Exception as e:
             logger.debug(f"Dashboard owners fetch failed: {e}")
 
-    def get(self, hostname: str) -> Optional[Machine]:
-        """Look up a machine by hostname (case-insensitive)."""
-        key = hostname.lower()
-        return self._temp_machines.get(key) or self._machines.get(key)
+    def get(self, name: str) -> Optional[Machine]:
+        """Look up a machine by hostname or IP address (case-insensitive)."""
+        key = name.lower()
+        # Try hostname first (fast dict lookup)
+        result = self._temp_machines.get(key) or self._machines.get(key)
+        if result:
+            return result
+        # Fall back to IP address scan
+        for m in self._temp_machines.values():
+            if m.ip == name:
+                return m
+        for m in self._machines.values():
+            if m.ip == name:
+                return m
+        return None
 
     def add_temporary(self, hostname: str, ip: str, username: str,
                       password: str = "", key_file: str = "") -> Machine:
@@ -129,6 +140,30 @@ class MachineStore:
             password=password, key_file=key_file, temporary=True
         )
         self._temp_machines[key] = m
+        return m
+
+    def add_permanent(self, hostname: str, ip: str, username: str,
+                      password: str = "", key_file: str = "",
+                      auth_file: Optional[Path] = None) -> Machine:
+        """Add a machine permanently to the hosts file.
+
+        Appends a line to the auth_file and loads it into the store.
+        Only password-based entries are written (hosts file format is hostname<TAB>IP<TAB>user:pass).
+        """
+        key = hostname.lower()
+        if key in self._machines or key in self._temp_machines:
+            raise ValueError(f"Machine '{hostname}' already exists")
+        if not auth_file:
+            raise ValueError("No auth_file configured - cannot save permanently")
+        if not password:
+            raise ValueError("Permanent hosts file entries require a password (format: host<TAB>IP<TAB>user:pass)")
+
+        line = f"{hostname}\t{ip}\t{username}:{password}\n"
+        with open(auth_file, "a") as f:
+            f.write(line)
+
+        m = Machine(hostname=hostname, ip=ip, username=username, password=password)
+        self._machines[key] = m
         return m
 
     def list_ssh_machines(self) -> list[Machine]:

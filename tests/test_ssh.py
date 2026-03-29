@@ -69,6 +69,21 @@ def test_format_output_with_error():
     assert "ERROR:" in formatted
 
 
+def test_format_output_empty_failure():
+    """format() adds '(no output)' when command fails with no stdout/stderr."""
+    r = CommandResult(stdout="", stderr="", exit_code=1)
+    formatted = r.format()
+    assert "[exit_code: 1]" in formatted
+    assert "(no output)" in formatted
+
+
+def test_format_output_empty_success_no_hint():
+    """format() does NOT add '(no output)' on success with empty output."""
+    r = CommandResult(stdout="", stderr="", exit_code=0)
+    formatted = r.format()
+    assert "(no output)" not in formatted
+
+
 def test_read_remote_file_binary_rejected():
     conn = SSHConnection("1.2.3.4", "user", "pass")
     conn._client = MagicMock()

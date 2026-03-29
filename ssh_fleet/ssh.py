@@ -44,6 +44,8 @@ class CommandResult:
             parts.append(formatted)
         if self.stderr:
             parts.append(f"STDERR: {self.stderr}")
+        if self.exit_code != 0 and not self.stdout and not self.stderr:
+            parts.append("(no output)")
         return "\n".join(parts)
 
 
