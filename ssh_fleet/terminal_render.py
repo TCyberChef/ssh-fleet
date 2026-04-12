@@ -69,6 +69,7 @@ class RenderOptions:
     max_line_chars: int = 140
     font_size: int = 14
     sudo: bool = False                     # visual "sudo " prefix in yellow
+    min_height: Optional[int] = None       # ensure SVG is at least this tall (for animation frames)
 
 
 def _clean(text: str) -> str:
@@ -162,6 +163,8 @@ def render_terminal_svg(
 
     total_rows = max(len(prompt_wrapped) + len(output_rows), 1)
     height = int(TITLE_BAR_HEIGHT + PADDING + total_rows * line_height + PADDING)
+    if opts.min_height:
+        height = max(height, opts.min_height)
 
     # --- Assemble SVG ---
     title = opts.title or f"{opts.prompt_user}@{opts.prompt_host}: ~"
@@ -232,6 +235,82 @@ def render_terminal_svg(
 
     parts.append("</svg>")
     return "\n".join(parts)
+
+
+def _extract_height(svg: str) -> int:
+    """Extract the height attribute from an SVG string."""
+    m = re.search(r'<svg[^>]*\bheight="(\d+)"', svg)
+    return int(m.group(1)) if m else 0
+
+
+def render_terminal_frames(
+    command: str,
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+    opts: RenderOptions,
+    batch_lines: int = 1,
+) -> list[str]:
+    """Generate progressive SVG frames for an animated terminal GIF.
+
+    Returns a list of SVG strings, each showing progressively more output:
+      - Frame 0: prompt + command, no output yet
+      - Frames 1..N: progressive stdout reveal (batch_lines per frame)
+      - Frames N+1..M: progressive stderr reveal after all stdout
+      - Final frame: full content (same as last progressive frame)
+
+    All frames have identical dimensions (set via min_height from the
+    full-content render).
+    """
+    from dataclasses import replace
+
+    # Render full content first to get the natural height
+    full_svg = render_terminal_svg(command, stdout, stderr, exit_code, opts)
+    target_height = _extract_height(full_svg)
+
+    # All frames use this height
+    frame_opts = replace(opts, min_height=target_height)
+
+    stdout_lines = _split_lines(stdout)
+    stderr_lines = _split_lines(stderr)
+
+    # If no output at all, just one frame (the prompt)
+    if not stdout_lines and not stderr_lines:
+        return [full_svg]
+
+    frames: list[str] = []
+
+    # Frame 0: prompt + command, no output
+    frames.append(render_terminal_svg(command, "", "", exit_code, frame_opts))
+
+    # Progressive stdout reveal
+    for i in range(batch_lines, len(stdout_lines) + 1, batch_lines):
+        partial_stdout = "\n".join(stdout_lines[:i])
+        frames.append(render_terminal_svg(
+            command, partial_stdout, "", exit_code, frame_opts
+        ))
+
+    # If batch_lines didn't land exactly on the last stdout line, add it
+    if stdout_lines and len(stdout_lines) % batch_lines != 0:
+        frames.append(render_terminal_svg(
+            command, "\n".join(stdout_lines), "", exit_code, frame_opts
+        ))
+
+    # Progressive stderr reveal (after all stdout)
+    full_stdout = "\n".join(stdout_lines) if stdout_lines else ""
+    for i in range(batch_lines, len(stderr_lines) + 1, batch_lines):
+        partial_stderr = "\n".join(stderr_lines[:i])
+        frames.append(render_terminal_svg(
+            command, full_stdout, partial_stderr, exit_code, frame_opts
+        ))
+
+    # If batch_lines didn't land exactly on the last stderr line, add it
+    if stderr_lines and len(stderr_lines) % batch_lines != 0:
+        frames.append(render_terminal_svg(
+            command, full_stdout, "\n".join(stderr_lines), exit_code, frame_opts
+        ))
+
+    return frames
 
 
 def _render_colored_prompt(x: int, y: float, opts: RenderOptions, command_clean: str) -> str:

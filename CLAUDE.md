@@ -35,7 +35,7 @@ Five modules in `ssh_fleet/`:
   - `SudoShell` - uses `invoke_shell()` for persistent interactive shell. Elevates to root once via `sudo su -`. Uses start/end marker pairs for reliable output parsing. Multi-line commands are base64-encoded to avoid interactive shell quoting issues.
 - **`pool.py`** - Connection pool with per-machine asyncio locks, idle cleanup (runs every 60s), and shell session management. Bridges sync paramiko calls to async via `asyncio.to_thread()`. Dead shells are auto-cleaned with actionable error messages.
 - **`machines.py`** - Machine inventory from hosts file (tab-separated), optional dashboard metadata enrichment, temporary (session-only) and permanent machine registration. Lookup by hostname or IP address.
-- **`terminal_render.py`** - Pure stdlib SVG renderer. Data in (command + stdout + stderr + exit_code + `RenderOptions`), SVG string out. No SSH, no MCP, no async. Catppuccin Mocha palette, macOS window chrome, f-string generated. Used by the `render_command` tool.
+- **`terminal_render.py`** - Pure stdlib SVG renderer. Data in (command + stdout + stderr + exit_code + `RenderOptions`), SVG string out. No SSH, no MCP, no async. Catppuccin Mocha palette, macOS window chrome, f-string generated. Used by `render_command` and `render_gif` tools. Also contains `render_terminal_frames()` for generating progressive SVG frames (animated GIF support).
 
 ### exec vs shell: Key Difference
 
@@ -64,6 +64,10 @@ Five modules in `ssh_fleet/`:
 ### Guide rendering (`render_command`)
 
 The `render_command` tool runs a command through the existing `ConnectionPool` and renders its real output as a self-contained SVG terminal screenshot (Catppuccin Mocha, macOS window chrome, drop shadow, colored prompt). Pure stdlib - no `cairosvg`, no Playwright, no new dependencies. The pure renderer lives in `ssh_fleet/terminal_render.py` and is trivially unit-testable; the MCP tool in `server.py` wires it to the pool and writes the result to `_guide_output_dir` (configurable via `guide_output_dir` in `~/.ssh-fleet/config.yaml`, defaults to `~/.ssh-fleet/guides`). ANSI handling reuses `_strip_ansi` from `ssh.py` and layers a supplementary regex for bare C1 controls (like `\x1b=` / `\x1b>` emitted by `systemctl status` under a pty) that the shared regex doesn't catch - the fix lives in the renderer, not in `ssh.py`, to keep `SudoShell`'s marker-parsing behavior untouched. **Tip:** for guides that highlight errors, pass `sudo=False` - the default sudo path merges stderr into stdout at the PTY level, so the red-stderr rendering only triggers on the non-sudo path.
+
+### Animated GIF rendering (`render_gif`)
+
+The `render_gif` and `render_gif_output` tools produce looping animated GIFs showing commands being typed and output appearing line by line. Built on the same renderer as static screenshots (visual consistency guaranteed). The pipeline: `render_terminal_frames()` generates progressive SVG frames (each with `min_height` set for uniform dimensions), `rsvg-convert` converts each to PNG, ffmpeg stitches them into a GIF with per-frame timing (prompt hold, line delay, final hold). **External requirements:** `brew install librsvg ffmpeg`. The `batch_lines` parameter controls how many lines appear per frame (use 3+ for long output to keep GIFs reasonable). `max_output_lines` defaults to 50 (not 200) since each line becomes a frame. Note: `rsvg-convert` also powers the existing `fmt='png'` for static screenshots (replaced qlmanage which produced broken square-canvas output).
 
 ### Tool Parameters
 

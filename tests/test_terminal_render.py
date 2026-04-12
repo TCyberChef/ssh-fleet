@@ -4,7 +4,9 @@ Pure tests — no SSH, no MCP. Literal strings in, SVG string out.
 """
 import re
 
-from ssh_fleet.terminal_render import render_terminal_svg, RenderOptions
+from ssh_fleet.terminal_render import (
+    render_terminal_svg, render_terminal_frames, RenderOptions, _extract_height,
+)
 
 
 def test_basic_success_contains_command_and_output():
@@ -182,3 +184,106 @@ def test_dec_keypad_escapes_stripped_cleanly():
     # No row that is just ">" (bug: \x1b> leaked as literal '>')
     weird = re.findall(r"<text[^>]*>&gt;</text>|<text[^>]*>></text>", svg)
     assert not weird, f"stray '>' rows: {weird}"
+
+
+# --- min_height tests ---
+
+
+def test_min_height_respected():
+    """SVG with min_height > natural height produces taller SVG."""
+    natural = render_terminal_svg("ls", "hi", "", 0, RenderOptions())
+    natural_h = _extract_height(natural)
+
+    tall = render_terminal_svg(
+        "ls", "hi", "", 0, RenderOptions(min_height=natural_h + 200)
+    )
+    tall_h = _extract_height(tall)
+    assert tall_h == natural_h + 200
+
+
+def test_min_height_no_effect_when_smaller():
+    """min_height smaller than natural height does not shrink the SVG."""
+    natural = render_terminal_svg("ls", "hi", "", 0, RenderOptions())
+    natural_h = _extract_height(natural)
+
+    same = render_terminal_svg(
+        "ls", "hi", "", 0, RenderOptions(min_height=10)
+    )
+    assert _extract_height(same) == natural_h
+
+
+# --- render_terminal_frames tests ---
+
+
+def test_render_frames_count():
+    """5 stdout lines + batch_lines=1 = 6 frames (1 prompt + 5 output)."""
+    stdout = "\n".join(f"line {i}" for i in range(5))
+    frames = render_terminal_frames("ls", stdout, "", 0, RenderOptions())
+    assert len(frames) == 6  # 1 prompt + 5 lines
+
+
+def test_render_frames_progressive_content():
+    """Each frame contains more text elements than the previous one."""
+    stdout = "\n".join(f"row {i}" for i in range(4))
+    frames = render_terminal_frames("ls", stdout, "", 0, RenderOptions())
+
+    # Frame 0 (prompt only) should NOT contain output
+    assert "row 0" not in frames[0]
+    # Frame 1 should contain row 0
+    assert "row 0" in frames[1]
+    assert "row 1" not in frames[1]
+    # Final frame should contain all rows
+    assert "row 3" in frames[-1]
+
+
+def test_render_frames_uniform_height():
+    """All frames must have identical height (no jumpy GIF)."""
+    stdout = "\n".join(f"line {i}" for i in range(8))
+    frames = render_terminal_frames("ls", stdout, "", 0, RenderOptions())
+
+    heights = [_extract_height(f) for f in frames]
+    assert len(set(heights)) == 1, f"heights vary: {heights}"
+
+
+def test_render_frames_batch_lines():
+    """batch_lines=3 with 9 lines = 4 frames (1 prompt + 3 batches)."""
+    stdout = "\n".join(f"line {i}" for i in range(9))
+    frames = render_terminal_frames(
+        "ls", stdout, "", 0, RenderOptions(), batch_lines=3
+    )
+    assert len(frames) == 4  # 1 prompt + 3 batches of 3
+
+
+def test_render_frames_batch_lines_remainder():
+    """batch_lines=3 with 7 lines = 4 frames (1 prompt + 2 full batches + 1 remainder)."""
+    stdout = "\n".join(f"line {i}" for i in range(7))
+    frames = render_terminal_frames(
+        "ls", stdout, "", 0, RenderOptions(), batch_lines=3
+    )
+    # prompt + batch(3) + batch(6) + remainder(7) = 4 frames
+    assert len(frames) == 4
+    # Final frame has all 7 lines
+    assert "line 6" in frames[-1]
+
+
+def test_render_frames_empty_output():
+    """No stdout or stderr = 1 frame (just the full-content render)."""
+    frames = render_terminal_frames("true", "", "", 0, RenderOptions())
+    assert len(frames) == 1
+    assert "<svg" in frames[0]
+
+
+def test_render_frames_stderr_after_stdout():
+    """Stderr frames appear after all stdout frames are shown."""
+    frames = render_terminal_frames(
+        "cat /missing", "found this", "error: not found", 1, RenderOptions()
+    )
+    # Frame 0: prompt only (no output)
+    assert "found this" not in frames[0]
+    assert "error: not found" not in frames[0]
+    # Frame 1: stdout visible, stderr not yet
+    assert "found this" in frames[1]
+    assert "error: not found" not in frames[1]
+    # Final frame: both visible
+    assert "found this" in frames[-1]
+    assert "error: not found" in frames[-1]

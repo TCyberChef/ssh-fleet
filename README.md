@@ -20,9 +20,12 @@ Unlike other SSH MCP servers that require one process per host, ssh-fleet manage
 |------|-------------|
 | `exec` | Run a command on a remote machine |
 | `sudo_exec` | Run a command with sudo elevation |
-| `render_command` | Run a command and render its output as an SVG terminal screenshot |
+| `render_command` | Run a command and render its output as an SVG/PNG terminal screenshot |
+| `render_output` | Render a terminal screenshot from literal text (no SSH) |
+| `render_gif` | Run a command and render an animated GIF showing output appearing line by line |
+| `render_gif_output` | Render an animated GIF from literal text (no SSH) |
 | `list_machines` | List all machines with metadata |
-| `add_machine` | Register a temporary machine (session-only) |
+| `add_host` | Register a temporary or permanent machine |
 | `reload_machines` | Re-read hosts file and refresh metadata |
 | `read_file` | Read a remote file via SFTP |
 | `upload` | Upload a local file to a remote machine |
@@ -142,7 +145,35 @@ The SVG is self-contained (no web fonts, no JS, no external CSS), styled with Ca
 
 - Output directory is configurable via `guide_output_dir` in `~/.ssh-fleet/config.yaml` (default: `~/.ssh-fleet/guides`).
 - Override the filename with `output_name="my-example"` instead of the auto-slugified command + timestamp.
+- `fmt="png"` converts to PNG via `rsvg-convert` (requires `brew install librsvg`).
 - **Tip:** for guides that highlight errors in red, pass `sudo=False`. The default `sudo=True` path merges stderr into stdout at the PTY level (needed for sudo password handling), so the red-stderr rendering only triggers when running without sudo elevation.
+
+### Animated GIF rendering
+
+Turn remote command output into animated GIFs that show commands being typed and output appearing line by line:
+
+```
+> render a GIF of kubectl get pods on nissan for the deployment guide
+# Claude calls: render_gif(host="nissan", command="kubectl get pods")
+# Returns:
+#   Rendered: /Users/you/.ssh-fleet/guides/kubectl-get-pods-1712743234.gif
+#   [exit_code: 0, 5 lines of output, 6 frames]
+```
+
+For pre-captured or idealized output, use `render_gif_output` (no SSH required):
+
+```
+> render a GIF showing systemctl restart output
+# Claude calls: render_gif_output(command="systemctl restart onwatch", stdout="...")
+```
+
+Animation parameters:
+- `line_delay_ms` - time between output lines appearing (default 200ms)
+- `hold_ms` - time to hold the final frame (default 3000ms)
+- `batch_lines` - lines to reveal per frame (default 1, use 3+ for long output)
+- `max_output_lines` - truncation limit (default 50, since each line = a frame)
+
+**Requirements:** `brew install librsvg ffmpeg`
 
 ### Dynamic machines
 ```

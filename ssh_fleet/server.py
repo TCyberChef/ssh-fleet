@@ -16,7 +16,11 @@ from mcp.server.fastmcp import FastMCP
 from ssh_fleet.machines import MachineStore
 from ssh_fleet.pool import ConnectionPool
 from ssh_fleet.ssh import SSHConnectionError
-from ssh_fleet.terminal_render import RenderOptions, render_terminal_svg
+import tempfile
+
+from ssh_fleet.terminal_render import (
+    RenderOptions, render_terminal_svg, render_terminal_frames,
+)
 
 # Configure logging to stderr (visible in Claude Code MCP debug)
 logging.basicConfig(
@@ -176,43 +180,108 @@ async def sudo_exec(host: str, command: str, timeout: int = 60) -> str:
 
 
 def _convert_svg_to_png(svg_path: Path) -> Path:
-    """Convert an SVG to PNG using macOS qlmanage (no new Python deps).
+    """Convert an SVG to PNG using rsvg-convert (from librsvg).
 
-    Produces a clean '<name>.png' alongside the SVG by renaming qlmanage's
-    default '<name>.svg.png' output. Raises RuntimeError with an actionable
-    message if qlmanage is unavailable or the conversion fails.
+    Produces a correctly-sized PNG at 1200px width, preserving the SVG's
+    aspect ratio. No padding, no square canvas issues.
+
+    Raises RuntimeError with an actionable message if rsvg-convert is
+    unavailable or the conversion fails.
     """
-    if shutil.which("qlmanage") is None:
+    if shutil.which("rsvg-convert") is None:
         raise RuntimeError(
-            "PNG output requires macOS qlmanage, which is not on PATH. "
-            "Use fmt='svg' instead, or run from a macOS machine."
+            "PNG output requires rsvg-convert (from librsvg). "
+            "Install with: brew install librsvg"
         )
 
+    clean_png = svg_path.with_suffix(".png")
     result = subprocess.run(
-        [
-            "qlmanage", "-t", "-s", "1200",
-            "-o", str(svg_path.parent),
-            str(svg_path),
-        ],
+        ["rsvg-convert", "-w", "1200", str(svg_path), "-o", str(clean_png)],
         capture_output=True,
         text=True,
         timeout=30,
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"qlmanage failed (exit {result.returncode}): {result.stderr.strip()}"
+            f"rsvg-convert failed (exit {result.returncode}): "
+            f"{result.stderr.strip()}"
+        )
+    if not clean_png.exists():
+        raise RuntimeError(
+            f"rsvg-convert reported success but {clean_png} was not created"
         )
 
-    # qlmanage writes '<svg_name>.png' in the -o directory; rename to drop the
-    # '.svg' middle segment so the final filename is '<name>.png'.
-    ugly_png = svg_path.parent / f"{svg_path.name}.png"
-    if not ugly_png.exists():
-        raise RuntimeError(
-            f"qlmanage reported success but {ugly_png} was not created"
-        )
-    clean_png = svg_path.with_suffix(".png")
-    ugly_png.rename(clean_png)
     return clean_png
+
+
+def _convert_frames_to_gif(
+    frames: list[str],
+    output_path: Path,
+    line_delay_ms: int = 200,
+    hold_ms: int = 3000,
+    prompt_hold_ms: int = 500,
+) -> Path:
+    """Convert a list of SVG frame strings into an animated GIF.
+
+    Pipeline: SVG strings -> temp SVG files -> PNG via rsvg-convert -> GIF via ffmpeg.
+    Raises RuntimeError with actionable messages if tools are missing.
+    """
+    if shutil.which("rsvg-convert") is None:
+        raise RuntimeError(
+            "GIF output requires rsvg-convert (from librsvg) for SVG-to-PNG "
+            "conversion. Install with: brew install librsvg"
+        )
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError(
+            "GIF output requires ffmpeg. Install with: brew install ffmpeg"
+        )
+
+    with tempfile.TemporaryDirectory(prefix="ssh-fleet-gif-") as tmpdir:
+        tmp = Path(tmpdir)
+
+        # Write SVG frames and convert each to PNG
+        png_paths: list[Path] = []
+        for i, svg_content in enumerate(frames):
+            svg_file = tmp / f"frame_{i:04d}.svg"
+            svg_file.write_text(svg_content, encoding="utf-8")
+            png_file = _convert_svg_to_png(svg_file)
+            png_paths.append(png_file)
+
+        # Build ffmpeg concat file with per-frame durations
+        concat_file = tmp / "concat.txt"
+        lines: list[str] = []
+        for i, png in enumerate(png_paths):
+            lines.append(f"file '{png}'")
+            if i == 0:
+                duration = prompt_hold_ms / 1000.0
+            elif i == len(png_paths) - 1:
+                duration = hold_ms / 1000.0
+            else:
+                duration = line_delay_ms / 1000.0
+            lines.append(f"duration {duration:.3f}")
+        # ffmpeg concat requires the last file repeated for its duration to take effect
+        lines.append(f"file '{png_paths[-1]}'")
+        concat_file.write_text("\n".join(lines), encoding="utf-8")
+
+        # Run ffmpeg with palette optimization for Catppuccin colors
+        result = subprocess.run(
+            [
+                "ffmpeg", "-y",
+                "-f", "concat", "-safe", "0", "-i", str(concat_file),
+                "-vf", "split[s0][s1];[s0]palettegen=max_colors=128[p];[s1][p]paletteuse=dither=bayer",
+                "-loop", "0",
+                str(output_path),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"ffmpeg failed (exit {result.returncode}): {result.stderr.strip()}"
+            )
+
+    return output_path
 
 
 def _save_svg_and_report(
@@ -256,6 +325,46 @@ def _save_svg_and_report(
             return f"ERROR: {e}"
 
     return f"Rendered: {final_path} \n[exit_code: {exit_code}, {n_lines} lines of output]"
+
+
+def _save_gif_and_report(
+    frames: list[str],
+    command: str,
+    output_name: Optional[str],
+    exit_code: int,
+    n_lines: int,
+    line_delay_ms: int = 200,
+    hold_ms: int = 3000,
+    prompt_hold_ms: int = 500,
+) -> str:
+    """Convert SVG frames to an animated GIF and return the standard result string.
+
+    Shared by render_gif (live SSH) and render_gif_output (offline/mocked).
+    """
+    if _guide_output_dir is None:
+        return "ERROR: guide output directory not configured"
+
+    if output_name:
+        filename = f"{output_name}.gif"
+    else:
+        filename = f"{_slugify_command(command)}-{int(time.time())}.gif"
+
+    gif_path = _guide_output_dir / filename
+    try:
+        _convert_frames_to_gif(
+            frames, gif_path,
+            line_delay_ms=line_delay_ms,
+            hold_ms=hold_ms,
+            prompt_hold_ms=prompt_hold_ms,
+        )
+    except RuntimeError as e:
+        return f"ERROR: {e}"
+
+    return (
+        f"Rendered: {gif_path} \n"
+        f"[exit_code: {exit_code}, {n_lines} lines of output, "
+        f"{len(frames)} frames]"
+    )
 
 
 @mcp_server.tool()
@@ -389,6 +498,145 @@ async def render_output(
     n_lines = len(stdout.splitlines()) + len(stderr.splitlines())
     return _save_svg_and_report(
         svg, command, output_name, exit_code, n_lines, fmt=fmt
+    )
+
+
+@mcp_server.tool()
+async def render_gif(
+    host: str,
+    command: str,
+    sudo: bool = True,
+    title: Optional[str] = None,
+    output_name: Optional[str] = None,
+    timeout: int = 60,
+    max_output_lines: int = 50,
+    prompt_cwd: str = "~",
+    line_delay_ms: int = 200,
+    hold_ms: int = 3000,
+    prompt_hold_ms: int = 500,
+    batch_lines: int = 1,
+) -> str:
+    """Run a command on a remote host and render the output as an animated GIF.
+
+    Like render_command, but produces a looping GIF that shows the command
+    being typed and output appearing line by line. Use for documentation
+    and tutorials where animation helps convey the experience.
+
+    max_output_lines defaults to 50 (not 200) because each line becomes a
+    frame. GIFs with 200+ frames are large and slow to generate.
+
+    Requires ffmpeg (brew install ffmpeg) and macOS qlmanage.
+
+    Args:
+        host: Hostname or IP (case-insensitive)
+        command: Shell command to execute
+        sudo: Run with sudo elevation (default true)
+        title: Optional title bar text; default "user@host: ~"
+        output_name: Optional filename stem (no extension)
+        timeout: Command timeout in seconds (default 60)
+        max_output_lines: Max output lines before truncation (default 50)
+        prompt_cwd: Working directory shown in the prompt (default "~")
+        line_delay_ms: Milliseconds between output line frames (default 200)
+        hold_ms: Milliseconds to hold the final frame (default 3000)
+        prompt_hold_ms: Milliseconds to hold the initial prompt frame (default 500)
+        batch_lines: Lines to reveal per frame (default 1). Use 3+ for long output.
+    """
+    m = store.get(host)
+    if not m:
+        return f"ERROR: Machine '{host}' not found. Use list_machines to see available machines."
+
+    try:
+        if sudo:
+            result = await pool.sudo_exec(m, command, timeout=timeout)
+        else:
+            result = await pool.exec(m, command, timeout=timeout)
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+
+    opts = RenderOptions(
+        prompt_user=m.username,
+        prompt_host=m.hostname,
+        prompt_cwd=prompt_cwd,
+        title=title or f"{m.username}@{m.hostname}: ~",
+        sudo=sudo,
+        max_output_lines=max_output_lines,
+    )
+    frames = render_terminal_frames(
+        command, result.stdout, result.stderr, result.exit_code,
+        opts, batch_lines=batch_lines,
+    )
+
+    n_lines = len(result.stdout.splitlines()) + len(result.stderr.splitlines())
+    return _save_gif_and_report(
+        frames, command, output_name, result.exit_code, n_lines,
+        line_delay_ms=line_delay_ms,
+        hold_ms=hold_ms,
+        prompt_hold_ms=prompt_hold_ms,
+    )
+
+
+@mcp_server.tool()
+async def render_gif_output(
+    command: str,
+    stdout: str = "",
+    stderr: str = "",
+    exit_code: int = 0,
+    prompt_user: str = "user",
+    prompt_host: str = "host",
+    prompt_cwd: str = "~",
+    sudo: bool = False,
+    title: Optional[str] = None,
+    output_name: Optional[str] = None,
+    max_output_lines: int = 50,
+    line_delay_ms: int = 200,
+    hold_ms: int = 3000,
+    prompt_hold_ms: int = 500,
+    batch_lines: int = 1,
+) -> str:
+    """Render an animated GIF from literal text without running any command.
+
+    Like render_output, but produces a looping animated GIF instead of a
+    static screenshot. You supply the command text, stdout, and stderr,
+    and get an animation showing the output appearing line by line.
+
+    Use for mocked or pre-captured output where you want animation.
+    Requires ffmpeg (brew install ffmpeg) and macOS qlmanage.
+
+    Args:
+        command: Command text to show on the prompt line
+        stdout: Literal stdout text to render (may be empty)
+        stderr: Literal stderr text to render in red (may be empty)
+        exit_code: Shown in the result summary
+        prompt_user: Username shown in the prompt (default "user")
+        prompt_host: Hostname shown in the prompt (default "host")
+        prompt_cwd: Working directory shown in the prompt (default "~")
+        sudo: Show yellow "sudo " prefix in the prompt (default false)
+        title: Optional title bar text; default "prompt_user@prompt_host: ~"
+        output_name: Optional filename stem (no extension)
+        max_output_lines: Max output lines before truncation (default 50)
+        line_delay_ms: Milliseconds between output line frames (default 200)
+        hold_ms: Milliseconds to hold the final frame (default 3000)
+        prompt_hold_ms: Milliseconds to hold the initial prompt frame (default 500)
+        batch_lines: Lines to reveal per frame (default 1). Use 3+ for long output.
+    """
+    opts = RenderOptions(
+        prompt_user=prompt_user,
+        prompt_host=prompt_host,
+        prompt_cwd=prompt_cwd,
+        title=title or f"{prompt_user}@{prompt_host}: ~",
+        sudo=sudo,
+        max_output_lines=max_output_lines,
+    )
+    frames = render_terminal_frames(
+        command, stdout, stderr, exit_code, opts, batch_lines=batch_lines,
+    )
+
+    n_lines = len(stdout.splitlines()) + len(stderr.splitlines())
+    return _save_gif_and_report(
+        frames, command, output_name, exit_code, n_lines,
+        line_delay_ms=line_delay_ms,
+        hold_ms=hold_ms,
+        prompt_hold_ms=prompt_hold_ms,
     )
 
 
