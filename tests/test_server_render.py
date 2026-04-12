@@ -181,24 +181,23 @@ async def test_render_output_supports_custom_prompt(server_env):
     assert "#f9e2af" in svg
 
 
-def _install_fake_qlmanage(monkeypatch, present: bool = True):
-    """Stub shutil.which + subprocess.run so fmt='png' can run without a real qlmanage.
+def _install_fake_rsvg(monkeypatch, present: bool = True):
+    """Stub shutil.which + subprocess.run so fmt='png' can run without rsvg-convert.
 
-    When present=True: shutil.which reports qlmanage, and subprocess.run simulates
-    a successful conversion by writing a fake PNG next to the SVG input, matching
-    qlmanage's real naming ("<svg_name>.png" in the -o dir).
+    When present=True: shutil.which reports rsvg-convert, and subprocess.run
+    writes a fake PNG at the -o path.
     When present=False: shutil.which returns None → helper should error cleanly.
     """
     def fake_which(name):
-        if present and name == "qlmanage":
-            return "/usr/bin/qlmanage"
+        if present and name == "rsvg-convert":
+            return "/opt/homebrew/bin/rsvg-convert"
         return None
 
     def fake_run(cmd, **kwargs):
-        # qlmanage -t -s <size> -o <dir> <svg_path>
-        out_dir = Path(cmd[cmd.index("-o") + 1])
-        svg_input = Path(cmd[-1])
-        (out_dir / f"{svg_input.name}.png").write_bytes(b"fake-png-bytes")
+        if cmd[0] == "rsvg-convert":
+            # rsvg-convert -w 1200 input.svg -o output.png
+            out_idx = cmd.index("-o")
+            Path(cmd[out_idx + 1]).write_bytes(b"fake-png-bytes")
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
     monkeypatch.setattr("shutil.which", fake_which)
@@ -208,7 +207,7 @@ def _install_fake_qlmanage(monkeypatch, present: bool = True):
 @pytest.mark.asyncio
 async def test_render_command_fmt_png_converts_via_qlmanage(server_env, monkeypatch):
     """fmt='png' runs qlmanage and returns the PNG path (with .png, not .svg.png)."""
-    _install_fake_qlmanage(monkeypatch, present=True)
+    _install_fake_rsvg(monkeypatch, present=True)
     server_env["store"].add_temporary("web-1", "1.2.3.4", "admin", password="pw")
     server_env["pool"].sudo_exec.return_value = CommandResult(
         stdout="hello", stderr="", exit_code=0
@@ -217,13 +216,10 @@ async def test_render_command_fmt_png_converts_via_qlmanage(server_env, monkeypa
     result = await server.render_command("web-1", "echo hello", fmt="png")
 
     assert "Rendered:" in result
-    # The returned path should be the .png file, not the intermediate .svg
     pngs = list(server_env["guide_dir"].glob("*.png"))
     svgs = list(server_env["guide_dir"].glob("*.svg"))
     assert len(pngs) == 1, f"expected 1 PNG, got {pngs}"
     assert len(svgs) == 1, f"expected 1 SVG alongside, got {svgs}"
-    # Clean filename: no double .svg.png suffix
-    assert not pngs[0].name.endswith(".svg.png")
     assert pngs[0].name.endswith(".png")
     assert str(pngs[0]) in result
 
@@ -231,7 +227,7 @@ async def test_render_command_fmt_png_converts_via_qlmanage(server_env, monkeypa
 @pytest.mark.asyncio
 async def test_render_output_fmt_png_converts_via_qlmanage(server_env, monkeypatch):
     """render_output fmt='png' also produces a PNG via the same qlmanage path."""
-    _install_fake_qlmanage(monkeypatch, present=True)
+    _install_fake_rsvg(monkeypatch, present=True)
 
     result = await server.render_output(
         command="ls", stdout="file1.txt\nfile2.txt", fmt="png"
@@ -244,9 +240,9 @@ async def test_render_output_fmt_png_converts_via_qlmanage(server_env, monkeypat
 
 
 @pytest.mark.asyncio
-async def test_fmt_png_returns_error_when_qlmanage_missing(server_env, monkeypatch):
-    """On Linux (or missing qlmanage), fmt='png' returns a helpful ERROR, not a crash."""
-    _install_fake_qlmanage(monkeypatch, present=False)
+async def test_fmt_png_returns_error_when_rsvg_missing(server_env, monkeypatch):
+    """Missing rsvg-convert returns a helpful ERROR with install instructions."""
+    _install_fake_rsvg(monkeypatch, present=False)
     server_env["store"].add_temporary("web-1", "1.2.3.4", "admin", password="pw")
     server_env["pool"].sudo_exec.return_value = CommandResult(
         stdout="hello", stderr="", exit_code=0
@@ -255,6 +251,120 @@ async def test_fmt_png_returns_error_when_qlmanage_missing(server_env, monkeypat
     result = await server.render_command("web-1", "echo hello", fmt="png")
 
     assert result.startswith("ERROR:")
-    assert "qlmanage" in result
-    # Error should suggest the svg fallback so users know what to do
-    assert "svg" in result.lower()
+    assert "rsvg-convert" in result
+    assert "brew" in result
+
+
+# --- GIF pipeline tests ---
+
+
+def _install_fake_rsvg_and_ffmpeg(monkeypatch, rsvg=True, ffmpeg=True):
+    """Stub shutil.which + subprocess.run for both rsvg-convert and ffmpeg.
+
+    rsvg-convert: simulates PNG creation from SVG files.
+    ffmpeg: simulates GIF creation from the concat file.
+    """
+    def fake_which(name):
+        if rsvg and name == "rsvg-convert":
+            return "/opt/homebrew/bin/rsvg-convert"
+        if ffmpeg and name == "ffmpeg":
+            return "/opt/homebrew/bin/ffmpeg"
+        return None
+
+    real_run = subprocess.run
+
+    def fake_run(cmd, **kwargs):
+        if cmd[0] == "rsvg-convert":
+            out_idx = cmd.index("-o")
+            Path(cmd[out_idx + 1]).write_bytes(b"fake-png")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        elif cmd[0] == "ffmpeg":
+            output_path = Path(cmd[-1])
+            output_path.write_bytes(b"GIF89a-fake")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr("shutil.which", fake_which)
+    monkeypatch.setattr("subprocess.run", fake_run)
+
+
+@pytest.mark.asyncio
+async def test_render_gif_unknown_host_returns_error(server_env):
+    """Unknown host returns the standard error message."""
+    result = await server.render_gif("ghost", "ls")
+    assert result.startswith("ERROR:")
+    assert "ghost" in result
+    server_env["pool"].sudo_exec.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_render_gif_success(server_env, monkeypatch):
+    """Full GIF pipeline with mocked qlmanage + ffmpeg produces a .gif file."""
+    _install_fake_rsvg_and_ffmpeg(monkeypatch)
+    server_env["store"].add_temporary("web-1", "1.2.3.4", "admin", password="pw")
+    server_env["pool"].sudo_exec.return_value = CommandResult(
+        stdout="line 1\nline 2\nline 3", stderr="", exit_code=0
+    )
+
+    result = await server.render_gif("web-1", "echo test")
+
+    assert "Rendered:" in result
+    assert ".gif" in result
+    assert "3 lines" in result
+    assert "frames" in result
+
+    gifs = list(server_env["guide_dir"].glob("*.gif"))
+    assert len(gifs) == 1
+    assert gifs[0].read_bytes() == b"GIF89a-fake"
+
+
+@pytest.mark.asyncio
+async def test_render_gif_output_success(server_env, monkeypatch):
+    """render_gif_output (mock version) produces a GIF without SSH calls."""
+    _install_fake_rsvg_and_ffmpeg(monkeypatch)
+
+    result = await server.render_gif_output(
+        command="kubectl get pods",
+        stdout="NAME  READY\npod-1  1/1",
+        output_name="test-gif",
+    )
+
+    assert "Rendered:" in result
+    assert "test-gif.gif" in result
+    server_env["pool"].exec.assert_not_called()
+    server_env["pool"].sudo_exec.assert_not_called()
+
+    gifs = list(server_env["guide_dir"].glob("*.gif"))
+    assert len(gifs) == 1
+
+
+@pytest.mark.asyncio
+async def test_render_gif_no_ffmpeg(server_env, monkeypatch):
+    """Missing ffmpeg returns an actionable error with install instructions."""
+    _install_fake_rsvg_and_ffmpeg(monkeypatch, rsvg=True, ffmpeg=False)
+    server_env["store"].add_temporary("web-1", "1.2.3.4", "admin", password="pw")
+    server_env["pool"].sudo_exec.return_value = CommandResult(
+        stdout="hi", stderr="", exit_code=0
+    )
+
+    result = await server.render_gif("web-1", "echo hi")
+
+    assert result.startswith("ERROR:")
+    assert "ffmpeg" in result
+    assert "brew" in result
+
+
+@pytest.mark.asyncio
+async def test_render_gif_no_rsvg(server_env, monkeypatch):
+    """Missing rsvg-convert returns an actionable error."""
+    _install_fake_rsvg_and_ffmpeg(monkeypatch, rsvg=False, ffmpeg=True)
+    server_env["store"].add_temporary("web-1", "1.2.3.4", "admin", password="pw")
+    server_env["pool"].sudo_exec.return_value = CommandResult(
+        stdout="hi", stderr="", exit_code=0
+    )
+
+    result = await server.render_gif("web-1", "echo hi")
+
+    assert result.startswith("ERROR:")
+    assert "rsvg-convert" in result
+    assert "brew" in result
