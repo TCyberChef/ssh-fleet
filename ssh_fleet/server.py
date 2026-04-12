@@ -255,7 +255,7 @@ def _save_svg_and_report(
         except RuntimeError as e:
             return f"ERROR: {e}"
 
-    return f"Rendered: {final_path}\n[exit_code: {exit_code}, {n_lines} lines of output]"
+    return f"Rendered: {final_path} \n[exit_code: {exit_code}, {n_lines} lines of output]"
 
 
 @mcp_server.tool()
