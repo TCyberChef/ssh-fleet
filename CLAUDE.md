@@ -27,14 +27,15 @@ ssh-fleet
 
 ## Architecture
 
-Four modules in `ssh_fleet/`:
+Five modules in `ssh_fleet/`:
 
-- **`server.py`** - MCP tool definitions using FastMCP. Each `@mcp_server.tool()` function is a tool Claude Code can call. Global `store` (MachineStore) and `pool` (ConnectionPool) are module-level singletons.
+- **`server.py`** - MCP tool definitions using FastMCP. Each `@mcp_server.tool()` function is a tool Claude Code can call. Global `store` (MachineStore), `pool` (ConnectionPool), and `_guide_output_dir` are module-level singletons.
 - **`ssh.py`** - Low-level SSH via paramiko. Two execution paths:
   - `SSHConnection.run()` / `run_sudo()` - wraps commands in `bash -l -c` (login shell) via `shlex.quote` for full PATH and multi-line safety. Each call is a separate SSH channel.
   - `SudoShell` - uses `invoke_shell()` for persistent interactive shell. Elevates to root once via `sudo su -`. Uses start/end marker pairs for reliable output parsing. Multi-line commands are base64-encoded to avoid interactive shell quoting issues.
 - **`pool.py`** - Connection pool with per-machine asyncio locks, idle cleanup (runs every 60s), and shell session management. Bridges sync paramiko calls to async via `asyncio.to_thread()`. Dead shells are auto-cleaned with actionable error messages.
 - **`machines.py`** - Machine inventory from hosts file (tab-separated), optional dashboard metadata enrichment, temporary (session-only) and permanent machine registration. Lookup by hostname or IP address.
+- **`terminal_render.py`** - Pure stdlib SVG renderer. Data in (command + stdout + stderr + exit_code + `RenderOptions`), SVG string out. No SSH, no MCP, no async. Catppuccin Mocha palette, macOS window chrome, f-string generated. Used by the `render_command` tool.
 
 ### exec vs shell: Key Difference
 
@@ -59,6 +60,10 @@ Four modules in `ssh_fleet/`:
 ### Output Formatting
 
 `CommandResult.format()` auto-detects and pretty-prints JSON in stdout for LLM readability. Works on both pure JSON output and mixed text+JSON (per-line detection for lines >80 chars that look like complete JSON objects). Output is truncated at 50K chars. Failed commands with no output show `(no output)` hint.
+
+### Guide rendering (`render_command`)
+
+The `render_command` tool runs a command through the existing `ConnectionPool` and renders its real output as a self-contained SVG terminal screenshot (Catppuccin Mocha, macOS window chrome, drop shadow, colored prompt). Pure stdlib - no `cairosvg`, no Playwright, no new dependencies. The pure renderer lives in `ssh_fleet/terminal_render.py` and is trivially unit-testable; the MCP tool in `server.py` wires it to the pool and writes the result to `_guide_output_dir` (configurable via `guide_output_dir` in `~/.ssh-fleet/config.yaml`, defaults to `~/.ssh-fleet/guides`). ANSI handling reuses `_strip_ansi` from `ssh.py` and layers a supplementary regex for bare C1 controls (like `\x1b=` / `\x1b>` emitted by `systemctl status` under a pty) that the shared regex doesn't catch - the fix lives in the renderer, not in `ssh.py`, to keep `SudoShell`'s marker-parsing behavior untouched. **Tip:** for guides that highlight errors, pass `sudo=False` - the default sudo path merges stderr into stdout at the PTY level, so the red-stderr rendering only triggers on the non-sudo path.
 
 ### Tool Parameters
 

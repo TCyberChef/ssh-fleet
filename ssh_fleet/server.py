@@ -3,7 +3,11 @@
 Exposes SSH tools to Claude Code via the Model Context Protocol.
 """
 import logging
+import re
+import shutil
+import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -12,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from ssh_fleet.machines import MachineStore
 from ssh_fleet.pool import ConnectionPool
 from ssh_fleet.ssh import SSHConnectionError
+from ssh_fleet.terminal_render import RenderOptions, render_terminal_svg
 
 # Configure logging to stderr (visible in Claude Code MCP debug)
 logging.basicConfig(
@@ -40,6 +45,7 @@ mcp_server = FastMCP(
 # Config paths for reload
 _status_url: Optional[str] = None
 _auth_file: Optional[Path] = None
+_guide_output_dir: Optional[Path] = None
 
 
 def _find_config() -> Optional[Path]:
@@ -63,7 +69,7 @@ def _find_config() -> Optional[Path]:
 
 def _load_config() -> None:
     """Load config and populate machine store."""
-    global _status_url, _auth_file
+    global _status_url, _auth_file, _guide_output_dir
 
     try:
         import yaml
@@ -72,13 +78,13 @@ def _load_config() -> None:
         return
 
     config_path = _find_config()
-    if not config_path:
+    data = {}
+    if config_path:
+        logger.info(f"Using config: {config_path}")
+        with open(config_path) as f:
+            data = yaml.safe_load(f) or {}
+    else:
         logger.warning("No config found. Checked ~/.ssh-fleet/config.yaml and SSH_FLEET_CONFIG env var.")
-        return
-
-    logger.info(f"Using config: {config_path}")
-    with open(config_path) as f:
-        data = yaml.safe_load(f) or {}
 
     auth_file = data.get("auth_file", "")
     if auth_file:
@@ -93,6 +99,29 @@ def _load_config() -> None:
     if _status_url:
         store.load_dashboard(_status_url)
         logger.info("Dashboard metadata loaded")
+
+    # Guide output directory for render_command. Always set, even if mkdir fails,
+    # so the tool can surface a useful error on write.
+    guide_dir = Path(data.get("guide_output_dir", "~/.ssh-fleet/guides")).expanduser()
+    _guide_output_dir = guide_dir
+    try:
+        guide_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Guide output dir: {guide_dir}")
+    except OSError as e:
+        logger.warning(f"Cannot create guide output dir {guide_dir}: {e}")
+
+
+def _slugify_command(command: str) -> str:
+    """Slugify the first 40 chars of a command for use in a filename.
+
+    Lowercases, replaces non-alphanumeric runs with '-', collapses repeats,
+    and strips leading/trailing dashes. Falls back to 'cmd' if empty.
+    """
+    head = command[:40].lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", head)
+    slug = re.sub(r"-+", "-", slug)
+    slug = slug.strip("-")
+    return slug or "cmd"
 
 
 @mcp_server.tool()
@@ -144,6 +173,223 @@ async def sudo_exec(host: str, command: str, timeout: int = 60) -> str:
         return result.format()
     except SSHConnectionError as e:
         return f"ERROR: {e}"
+
+
+def _convert_svg_to_png(svg_path: Path) -> Path:
+    """Convert an SVG to PNG using macOS qlmanage (no new Python deps).
+
+    Produces a clean '<name>.png' alongside the SVG by renaming qlmanage's
+    default '<name>.svg.png' output. Raises RuntimeError with an actionable
+    message if qlmanage is unavailable or the conversion fails.
+    """
+    if shutil.which("qlmanage") is None:
+        raise RuntimeError(
+            "PNG output requires macOS qlmanage, which is not on PATH. "
+            "Use fmt='svg' instead, or run from a macOS machine."
+        )
+
+    result = subprocess.run(
+        [
+            "qlmanage", "-t", "-s", "1200",
+            "-o", str(svg_path.parent),
+            str(svg_path),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"qlmanage failed (exit {result.returncode}): {result.stderr.strip()}"
+        )
+
+    # qlmanage writes '<svg_name>.png' in the -o directory; rename to drop the
+    # '.svg' middle segment so the final filename is '<name>.png'.
+    ugly_png = svg_path.parent / f"{svg_path.name}.png"
+    if not ugly_png.exists():
+        raise RuntimeError(
+            f"qlmanage reported success but {ugly_png} was not created"
+        )
+    clean_png = svg_path.with_suffix(".png")
+    ugly_png.rename(clean_png)
+    return clean_png
+
+
+def _save_svg_and_report(
+    svg: str,
+    command: str,
+    output_name: Optional[str],
+    exit_code: int,
+    n_lines: int,
+    fmt: str = "svg",
+) -> str:
+    """Write an SVG to the guide output dir and return the standard result string.
+
+    If fmt='png', additionally converts the SVG to PNG via qlmanage and returns
+    the PNG path (the SVG is left in place as a secondary artifact for
+    regeneration or other use).
+
+    Shared by render_command (live SSH) and render_output (offline/mocked).
+    """
+    if _guide_output_dir is None:
+        return "ERROR: guide output directory not configured"
+
+    if fmt not in ("svg", "png"):
+        return f"ERROR: unknown fmt '{fmt}'; expected 'svg' or 'png'"
+
+    if output_name:
+        filename = f"{output_name}.svg"
+    else:
+        filename = f"{_slugify_command(command)}-{int(time.time())}.svg"
+
+    svg_path = _guide_output_dir / filename
+    try:
+        svg_path.write_text(svg, encoding="utf-8")
+    except OSError as e:
+        return f"ERROR: Cannot write to guide output directory: {svg_path} ({e})"
+
+    final_path = svg_path
+    if fmt == "png":
+        try:
+            final_path = _convert_svg_to_png(svg_path)
+        except RuntimeError as e:
+            return f"ERROR: {e}"
+
+    return f"Rendered: {final_path}\n[exit_code: {exit_code}, {n_lines} lines of output]"
+
+
+@mcp_server.tool()
+async def render_command(
+    host: str,
+    command: str,
+    sudo: bool = True,
+    title: Optional[str] = None,
+    output_name: Optional[str] = None,
+    timeout: int = 60,
+    max_output_lines: int = 200,
+    prompt_cwd: str = "~",
+    fmt: str = "svg",
+) -> str:
+    """Run a command on a remote host and render the output as a polished SVG terminal screenshot.
+
+    The SVG is saved to the configured guide output directory and the absolute
+    path is returned. Use this for blog posts, tutorials, and documentation -
+    the output shown is whatever the command actually printed on the remote machine.
+
+    sudo defaults to true (matches ssh-fleet's bias toward root for system commands).
+
+    Note: with sudo=True (the default), remote stderr is merged into stdout due
+    to PTY allocation for sudo password handling. Use sudo=False when you want
+    stderr to render in red.
+
+    Args:
+        host: Hostname or IP (case-insensitive)
+        command: Shell command to execute
+        sudo: Run with sudo elevation (default true)
+        title: Optional title bar text; default "user@host: ~"
+        output_name: Optional filename stem (no extension); default is slugified command + timestamp
+        timeout: Command timeout in seconds (default 60)
+        max_output_lines: Max output lines to render before truncation (default 200).
+            Raise this for long guides where every line matters.
+        prompt_cwd: Working directory shown in the prompt (default "~"). Set this
+            when the guide implies the operator is in a specific directory, e.g.
+            "/opt/onwatch".
+        fmt: Output format - "svg" (default) or "png". PNG output uses macOS
+            qlmanage for conversion (no new Python deps) and is the right choice
+            when you plan to drag the file into Confluence or other tools that
+            handle raster images better than SVG. SVG is left in place alongside
+            the PNG as a secondary artifact.
+    """
+    m = store.get(host)
+    if not m:
+        return f"ERROR: Machine '{host}' not found. Use list_machines to see available machines."
+
+    try:
+        if sudo:
+            result = await pool.sudo_exec(m, command, timeout=timeout)
+        else:
+            result = await pool.exec(m, command, timeout=timeout)
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+
+    opts = RenderOptions(
+        prompt_user=m.username,
+        prompt_host=m.hostname,
+        prompt_cwd=prompt_cwd,
+        title=title or f"{m.username}@{m.hostname}: ~",
+        sudo=sudo,
+        max_output_lines=max_output_lines,
+    )
+    svg = render_terminal_svg(
+        command, result.stdout, result.stderr, result.exit_code, opts
+    )
+
+    n_lines = len(result.stdout.splitlines()) + len(result.stderr.splitlines())
+    return _save_svg_and_report(
+        svg, command, output_name, result.exit_code, n_lines, fmt=fmt
+    )
+
+
+@mcp_server.tool()
+async def render_output(
+    command: str,
+    stdout: str = "",
+    stderr: str = "",
+    exit_code: int = 0,
+    prompt_user: str = "user",
+    prompt_host: str = "host",
+    prompt_cwd: str = "~",
+    sudo: bool = False,
+    title: Optional[str] = None,
+    output_name: Optional[str] = None,
+    max_output_lines: int = 200,
+    fmt: str = "svg",
+) -> str:
+    """Render a terminal screenshot from literal text without running any command.
+
+    Unlike render_command, this tool does NO SSH. You supply the command text,
+    stdout, and stderr yourself, and get back an SVG terminal screenshot. Use
+    this for:
+      - Idealized "here's what success looks like" guide screenshots
+      - Output you already captured from logs, journalctl, or a previous session
+      - Commands that would take too long to reproduce live
+      - Machines that aren't in the fleet or are unreachable at write-time
+
+    The prompt is fully customizable (user/host/cwd/sudo) because there is no
+    machine record to pull those from. This is the intended "mock a screenshot"
+    tool for guide authors.
+
+    Args:
+        command: Command text to show on the prompt line
+        stdout: Literal stdout text to render (may be empty)
+        stderr: Literal stderr text to render in red (may be empty)
+        exit_code: Shown in the result summary; does not affect the SVG
+        prompt_user: Username shown in the prompt (default "user")
+        prompt_host: Hostname shown in the prompt (default "host")
+        prompt_cwd: Working directory shown in the prompt (default "~")
+        sudo: Show yellow "sudo " prefix in the prompt (default false)
+        title: Optional title bar text; default "prompt_user@prompt_host: ~"
+        output_name: Optional filename stem (no extension); default is slugified command + timestamp
+        max_output_lines: Max output lines to render before truncation (default 200)
+        fmt: Output format - "svg" (default) or "png". PNG output uses macOS
+            qlmanage for conversion (no new Python deps) and is the right choice
+            when you plan to drag the file into Confluence or other tools that
+            handle raster images better than SVG.
+    """
+    opts = RenderOptions(
+        prompt_user=prompt_user,
+        prompt_host=prompt_host,
+        prompt_cwd=prompt_cwd,
+        title=title or f"{prompt_user}@{prompt_host}: ~",
+        sudo=sudo,
+        max_output_lines=max_output_lines,
+    )
+    svg = render_terminal_svg(command, stdout, stderr, exit_code, opts)
+
+    n_lines = len(stdout.splitlines()) + len(stderr.splitlines())
+    return _save_svg_and_report(
+        svg, command, output_name, exit_code, n_lines, fmt=fmt
+    )
 
 
 @mcp_server.tool()
