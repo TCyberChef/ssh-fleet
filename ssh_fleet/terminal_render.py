@@ -162,7 +162,14 @@ def render_terminal_svg(
     width = int(max(MIN_WIDTH, min(MAX_WIDTH, raw_width)))
 
     total_rows = max(len(prompt_wrapped) + len(output_rows), 1)
-    height = int(TITLE_BAR_HEIGHT + PADDING + total_rows * line_height + PADDING)
+    # Content height: first row's ascent (font_size) + pitch between the
+    # remaining rows (line_height each). The last row does NOT reserve an
+    # inter-line gap below itself — that's what produced visible dead space.
+    height = int(
+        TITLE_BAR_HEIGHT + PADDING
+        + font_size + (total_rows - 1) * line_height
+        + PADDING
+    )
     if opts.min_height:
         height = max(height, opts.min_height)
 

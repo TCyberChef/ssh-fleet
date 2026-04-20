@@ -5,7 +5,24 @@
       "Bash(pytest tests/ -v)",
       "mcp__ssh-fleet__list_machines",
       "mcp__ssh-fleet__sudo_exec",
-      "Bash(git add:*)"
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "mcp__ssh-fleet__shell_open",
+      "mcp__ssh-fleet__shell_run",
+      "mcp__ssh-fleet__shell_close",
+      "Bash(/Users/tbroyer/.claude/plugins/marketplaces/claude-plugins-official/plugins/learning-output-style/hooks-handlers/session-start.sh)",
+      "Bash(gh api:*)",
+      "Bash(pytest tests/ -v --tb=short)",
+      "Bash(rtk proxy:*)",
+      "mcp__ssh-fleet__render_command",
+      "Bash(qlmanage -t -s 1200 -o /tmp /Users/tbroyer/.ssh-fleet/guides/guide-step2-check-gpu.svg)",
+      "Bash(qlmanage -t -s 1200 -o /tmp /Users/tbroyer/.ssh-fleet/guides/guide-step1-check-pods.svg)",
+      "Bash(qlmanage -t -s 1200 -o /tmp /Users/tbroyer/.ssh-fleet/guides/guide-step1-check-pods-v2.svg)",
+      "Bash(rtk git *)",
+      "Bash(rtk ls *)",
+      "Bash(rtk grep *)",
+      "Bash(rtk find *)"
     ]
   }
 }

@@ -131,21 +131,21 @@ Once registered, Claude Code can use ssh-fleet tools directly:
 
 ### Guide rendering
 
-Turn a remote command into a polished SVG terminal screenshot for blog posts, tutorials, or Markdown guides:
+Turn a remote command into a polished PNG terminal screenshot for blog posts, tutorials, or Markdown guides:
 
 ```
 > render kubectl get nodes -o wide on nissan for the k3s deployment guide
 # Claude calls: render_command(host="nissan", command="kubectl get nodes -o wide")
 # Returns:
-#   Rendered: /Users/you/.ssh-fleet/guides/kubectl-get-nodes-o-wide-1712743234.svg
+#   Rendered: /Users/you/.ssh-fleet/guides/kubectl-get-nodes-o-wide-1712743234.png
 #   [exit_code: 0, 2 lines of output]
 ```
 
-The SVG is self-contained (no web fonts, no JS, no external CSS), styled with Catppuccin Mocha colors, macOS-style window chrome, drop shadow, and a colored prompt line showing the real `user@host` from your hosts file. Drop it straight into a blog post, MDX file, or Confluence page.
+The image is styled with Catppuccin Mocha colors, macOS-style window chrome, drop shadow, and a colored prompt line showing the real `user@host` from your hosts file. Drop it straight into a blog post, MDX file, or Confluence page.
 
 - Output directory is configurable via `guide_output_dir` in `~/.ssh-fleet/config.yaml` (default: `~/.ssh-fleet/guides`).
 - Override the filename with `output_name="my-example"` instead of the auto-slugified command + timestamp.
-- `fmt="png"` converts to PNG via `rsvg-convert` (requires `brew install librsvg`).
+- Requires `rsvg-convert` for SVG-to-PNG conversion (`brew install librsvg`). The SVG is a tempfile intermediate and never lands in the guide directory.
 - **Tip:** for guides that highlight errors in red, pass `sudo=False`. The default `sudo=True` path merges stderr into stdout at the PTY level (needed for sudo password handling), so the red-stderr rendering only triggers when running without sudo elevation.
 
 ### Animated GIF rendering

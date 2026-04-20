@@ -179,11 +179,13 @@ async def sudo_exec(host: str, command: str, timeout: int = 60) -> str:
         return f"ERROR: {e}"
 
 
-def _convert_svg_to_png(svg_path: Path) -> Path:
+def _convert_svg_to_png(svg_path: Path, png_path: Optional[Path] = None) -> Path:
     """Convert an SVG to PNG using rsvg-convert (from librsvg).
 
     Produces a correctly-sized PNG at 1200px width, preserving the SVG's
-    aspect ratio. No padding, no square canvas issues.
+    aspect ratio. If png_path is None, writes alongside the SVG with a
+    .png suffix (used by the GIF frame pipeline). Otherwise writes to
+    png_path (used by _save_png_and_report with a tempfile input).
 
     Raises RuntimeError with an actionable message if rsvg-convert is
     unavailable or the conversion fails.
@@ -194,7 +196,7 @@ def _convert_svg_to_png(svg_path: Path) -> Path:
             "Install with: brew install librsvg"
         )
 
-    clean_png = svg_path.with_suffix(".png")
+    clean_png = png_path if png_path is not None else svg_path.with_suffix(".png")
     result = subprocess.run(
         ["rsvg-convert", "-w", "1200", str(svg_path), "-o", str(clean_png)],
         capture_output=True,
@@ -284,47 +286,43 @@ def _convert_frames_to_gif(
     return output_path
 
 
-def _save_svg_and_report(
+def _save_png_and_report(
     svg: str,
     command: str,
     output_name: Optional[str],
     exit_code: int,
     n_lines: int,
-    fmt: str = "svg",
 ) -> str:
-    """Write an SVG to the guide output dir and return the standard result string.
+    """Render a PNG from an SVG string and return the standard result string.
 
-    If fmt='png', additionally converts the SVG to PNG via qlmanage and returns
-    the PNG path (the SVG is left in place as a secondary artifact for
-    regeneration or other use).
+    The SVG is written to a tempfile (auto-deleted), rsvg-convert produces the
+    PNG in the guide output dir, and the final path is returned. No SVG file
+    is left in the guide dir.
 
     Shared by render_command (live SSH) and render_output (offline/mocked).
     """
     if _guide_output_dir is None:
         return "ERROR: guide output directory not configured"
 
-    if fmt not in ("svg", "png"):
-        return f"ERROR: unknown fmt '{fmt}'; expected 'svg' or 'png'"
-
     if output_name:
-        filename = f"{output_name}.svg"
+        filename = f"{output_name}.png"
     else:
-        filename = f"{_slugify_command(command)}-{int(time.time())}.svg"
+        filename = f"{_slugify_command(command)}-{int(time.time())}.png"
+    png_path = _guide_output_dir / filename
 
-    svg_path = _guide_output_dir / filename
-    try:
-        svg_path.write_text(svg, encoding="utf-8")
-    except OSError as e:
-        return f"ERROR: Cannot write to guide output directory: {svg_path} ({e})"
-
-    final_path = svg_path
-    if fmt == "png":
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".svg", delete=True, encoding="utf-8",
+    ) as tmp:
+        tmp.write(svg)
+        tmp.flush()
         try:
-            final_path = _convert_svg_to_png(svg_path)
+            _convert_svg_to_png(Path(tmp.name), png_path)
         except RuntimeError as e:
             return f"ERROR: {e}"
+        except OSError as e:
+            return f"ERROR: Cannot write PNG to guide output directory: {png_path} ({e})"
 
-    return f"Rendered: {final_path} \n[exit_code: {exit_code}, {n_lines} lines of output]"
+    return f"Rendered: {png_path} \n[exit_code: {exit_code}, {n_lines} lines of output]"
 
 
 def _save_gif_and_report(
@@ -377,11 +375,10 @@ async def render_command(
     timeout: int = 60,
     max_output_lines: int = 200,
     prompt_cwd: str = "~",
-    fmt: str = "svg",
 ) -> str:
-    """Run a command on a remote host and render the output as a polished SVG terminal screenshot.
+    """Run a command on a remote host and render the output as a polished PNG terminal screenshot.
 
-    The SVG is saved to the configured guide output directory and the absolute
+    The PNG is saved to the configured guide output directory and the absolute
     path is returned. Use this for blog posts, tutorials, and documentation -
     the output shown is whatever the command actually printed on the remote machine.
 
@@ -390,6 +387,8 @@ async def render_command(
     Note: with sudo=True (the default), remote stderr is merged into stdout due
     to PTY allocation for sudo password handling. Use sudo=False when you want
     stderr to render in red.
+
+    Requires rsvg-convert (brew install librsvg) for SVG-to-PNG conversion.
 
     Args:
         host: Hostname or IP (case-insensitive)
@@ -403,11 +402,6 @@ async def render_command(
         prompt_cwd: Working directory shown in the prompt (default "~"). Set this
             when the guide implies the operator is in a specific directory, e.g.
             "/opt/onwatch".
-        fmt: Output format - "svg" (default) or "png". PNG output uses macOS
-            qlmanage for conversion (no new Python deps) and is the right choice
-            when you plan to drag the file into Confluence or other tools that
-            handle raster images better than SVG. SVG is left in place alongside
-            the PNG as a secondary artifact.
     """
     m = store.get(host)
     if not m:
@@ -434,8 +428,8 @@ async def render_command(
     )
 
     n_lines = len(result.stdout.splitlines()) + len(result.stderr.splitlines())
-    return _save_svg_and_report(
-        svg, command, output_name, result.exit_code, n_lines, fmt=fmt
+    return _save_png_and_report(
+        svg, command, output_name, result.exit_code, n_lines,
     )
 
 
@@ -452,12 +446,11 @@ async def render_output(
     title: Optional[str] = None,
     output_name: Optional[str] = None,
     max_output_lines: int = 200,
-    fmt: str = "svg",
 ) -> str:
     """Render a terminal screenshot from literal text without running any command.
 
     Unlike render_command, this tool does NO SSH. You supply the command text,
-    stdout, and stderr yourself, and get back an SVG terminal screenshot. Use
+    stdout, and stderr yourself, and get back a PNG terminal screenshot. Use
     this for:
       - Idealized "here's what success looks like" guide screenshots
       - Output you already captured from logs, journalctl, or a previous session
@@ -468,11 +461,13 @@ async def render_output(
     machine record to pull those from. This is the intended "mock a screenshot"
     tool for guide authors.
 
+    Requires rsvg-convert (brew install librsvg) for SVG-to-PNG conversion.
+
     Args:
         command: Command text to show on the prompt line
         stdout: Literal stdout text to render (may be empty)
         stderr: Literal stderr text to render in red (may be empty)
-        exit_code: Shown in the result summary; does not affect the SVG
+        exit_code: Shown in the result summary; does not affect rendering
         prompt_user: Username shown in the prompt (default "user")
         prompt_host: Hostname shown in the prompt (default "host")
         prompt_cwd: Working directory shown in the prompt (default "~")
@@ -480,10 +475,6 @@ async def render_output(
         title: Optional title bar text; default "prompt_user@prompt_host: ~"
         output_name: Optional filename stem (no extension); default is slugified command + timestamp
         max_output_lines: Max output lines to render before truncation (default 200)
-        fmt: Output format - "svg" (default) or "png". PNG output uses macOS
-            qlmanage for conversion (no new Python deps) and is the right choice
-            when you plan to drag the file into Confluence or other tools that
-            handle raster images better than SVG.
     """
     opts = RenderOptions(
         prompt_user=prompt_user,
@@ -496,8 +487,8 @@ async def render_output(
     svg = render_terminal_svg(command, stdout, stderr, exit_code, opts)
 
     n_lines = len(stdout.splitlines()) + len(stderr.splitlines())
-    return _save_svg_and_report(
-        svg, command, output_name, exit_code, n_lines, fmt=fmt
+    return _save_png_and_report(
+        svg, command, output_name, exit_code, n_lines,
     )
 
 
