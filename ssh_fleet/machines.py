@@ -144,19 +144,37 @@ class MachineStore:
 
     def add_permanent(self, hostname: str, ip: str, username: str,
                       password: str = "", key_file: str = "",
-                      auth_file: Optional[Path] = None) -> Machine:
+                      auth_file: Optional[Path] = None,
+                      overwrite: bool = False) -> Machine:
         """Add a machine permanently to the hosts file.
 
         Appends a line to the auth_file and loads it into the store.
         Only password-based entries are written (hosts file format is hostname<TAB>IP<TAB>user:pass).
+        With overwrite=True, drops any existing rows matching the hostname (case-insensitive)
+        or IP before appending. Comments and blank lines are preserved.
         """
         key = hostname.lower()
-        if key in self._machines or key in self._temp_machines:
-            raise ValueError(f"Machine '{hostname}' already exists")
+        if key in self._temp_machines:
+            raise ValueError(f"Machine '{hostname}' already exists as a temporary machine")
+        if key in self._machines and not overwrite:
+            raise ValueError(f"Machine '{hostname}' already exists (pass overwrite=True to replace)")
         if not auth_file:
             raise ValueError("No auth_file configured - cannot save permanently")
         if not password:
             raise ValueError("Permanent hosts file entries require a password (format: host<TAB>IP<TAB>user:pass)")
+
+        if overwrite and auth_file.exists():
+            kept = []
+            for raw in auth_file.read_text().splitlines(keepends=True):
+                parsed = Machine.from_line(raw)
+                if parsed and (parsed.hostname.lower() == key or parsed.ip == ip):
+                    continue
+                kept.append(raw)
+            if kept and not kept[-1].endswith("\n"):
+                kept[-1] += "\n"
+            auth_file.write_text("".join(kept))
+            for k in [k for k, m in self._machines.items() if k == key or m.ip == ip]:
+                self._machines.pop(k, None)
 
         line = f"{hostname}\t{ip}\t{username}:{password}\n"
         with open(auth_file, "a") as f:

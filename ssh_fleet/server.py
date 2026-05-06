@@ -793,27 +793,33 @@ async def shell_list() -> str:
 @mcp_server.tool()
 async def add_host(hostname: str, ip: str, username: str,
                    password: str = "", key_file: str = "",
-                   permanent: bool = False) -> str:
-    """Add a machine to the fleet. Permanent saves to the hosts file for future sessions.
+                   permanent: bool = True,
+                   overwrite: bool = False) -> str:
+    """Add a machine to the fleet. Defaults to permanent (saved to the hosts file).
 
     The machine is available immediately for exec/sudo_exec.
-    With permanent=False (default), it's session-only and gone when the session ends.
-    With permanent=True, it's appended to the hosts file and persists across sessions.
+    With permanent=True (default), it's appended to the hosts file and persists across sessions.
+    Pass permanent=False for a session-only entry (required when using key_file auth).
+    Pass overwrite=True to replace any existing permanent row with the same hostname or IP
+    (useful when the same IP is reused for a different physical machine).
 
     Args:
         hostname: Name for this machine
         ip: IP address
         username: SSH username
         password: SSH password (required for permanent; optional if using key_file for temp)
-        key_file: Path to SSH private key (only for temporary machines)
-        permanent: Save to hosts file for future sessions (default false)
+        key_file: Path to SSH private key (only for temporary machines; pass permanent=False)
+        permanent: Save to hosts file for future sessions (default true)
+        overwrite: Replace existing rows matching this hostname or IP (permanent only, default false)
     """
     try:
         if permanent:
             m = store.add_permanent(
-                hostname, ip, username, password=password, auth_file=_auth_file
+                hostname, ip, username, password=password,
+                auth_file=_auth_file, overwrite=overwrite,
             )
-            return f"Added '{hostname}' ({ip}) permanently to {_auth_file}. Ready for exec/sudo_exec."
+            suffix = " (replaced existing entry)" if overwrite else ""
+            return f"Added '{hostname}' ({ip}) permanently to {_auth_file}{suffix}. Ready for exec/sudo_exec."
         else:
             store.add_temporary(hostname, ip, username, password=password, key_file=key_file)
             auth_method = "key" if key_file else "password"
