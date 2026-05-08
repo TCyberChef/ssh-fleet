@@ -10,7 +10,8 @@ Unlike other SSH MCP servers that require one process per host, ssh-fleet manage
 - **Connection pooling** - SSH connections stay alive across tool calls, auto-reconnect on failure
 - **Parallel execution** - Run commands on multiple machines simultaneously
 - **Persistent shells** - Open a root shell once, run many commands without re-authenticating sudo
-- **SFTP** - Upload, download, and read remote files
+- **SFTP** - Upload, download, read, and write remote files
+- **Staged scripts** - Run long scripts and tmux wrappers without fragile heredocs
 - **Dynamic machines** - Add machines on the fly without restarting
 - **SSH key + password auth** - Supports both authentication methods
 
@@ -28,8 +29,17 @@ Unlike other SSH MCP servers that require one process per host, ssh-fleet manage
 | `add_host` | Register a temporary or permanent machine |
 | `reload_machines` | Re-read hosts file and refresh metadata |
 | `read_file` | Read a remote file via SFTP |
+| `write_file` | Write remote text content via SFTP staging |
 | `upload` | Upload a local file to a remote machine |
 | `download` | Download a remote file to local |
+| `run_script` | Stage and run a bash script without inline heredocs |
+| `tmux_new` | Start a detached remote tmux session |
+| `tmux_list` | List remote tmux sessions |
+| `tmux_capture` | Capture output from a remote tmux pane |
+| `tmux_wait` | Wait for text or regex in a remote tmux pane |
+| `tmux_paste` | Paste arbitrary text into a tmux pane via SFTP buffer |
+| `tmux_send_keys` | Send tmux key tokens like `C-c` or `Enter` |
+| `tmux_kill` | Kill a remote tmux session |
 | `shell_open` | Open a persistent root shell |
 | `shell_run` | Run a command in a persistent shell |
 | `shell_close` | Close a persistent shell |
@@ -86,7 +96,7 @@ For machines using SSH keys, you can add them dynamically:
 
 Claude Code calls:
 ```
-add_machine(hostname="aws-prod", ip="10.0.1.100", username="ec2-user", key_file="~/.ssh/aws.pem")
+add_host(hostname="aws-prod", ip="10.0.1.100", username="ec2-user", key_file="~/.ssh/aws.pem")
 ```
 
 ## Usage
@@ -96,10 +106,10 @@ Once registered, Claude Code can use ssh-fleet tools directly:
 ### Run commands
 ```
 > check disk usage on web-1
-# Claude calls: exec(machine="web-1", command="df -h")
+# Claude calls: exec(host="web-1", command="df -h")
 
 > run kubectl get pods on db-1 with sudo
-# Claude calls: sudo_exec(machine="db-1", command="kubectl get pods -A")
+# Claude calls: sudo_exec(host="db-1", command="kubectl get pods -A")
 ```
 
 ### Parallel execution
@@ -111,7 +121,7 @@ Once registered, Claude Code can use ssh-fleet tools directly:
 ### Persistent shell (for multi-command sessions)
 ```
 > open a shell on web-1
-# Claude calls: shell_open(machine="web-1")
+# Claude calls: shell_open(host="web-1")
 # Returns: session ID "shell-web-1-1"
 
 > list pods, then describe the failing one
@@ -123,11 +133,73 @@ Once registered, Claude Code can use ssh-fleet tools directly:
 ### File operations
 ```
 > read /etc/os-release on staging
-# Claude calls: read_file(machine="staging", remote_path="/etc/os-release")
+# Claude calls: read_file(host="staging", remote_path="/etc/os-release")
+
+> write a root-owned config file on web-1
+# Claude calls: write_file(host="web-1", remote_path="/etc/example.conf",
+#                          content="KEY=value\n", sudo=True, mode="0640",
+#                          owner="root:root")
 
 > upload ./fix.sh to /tmp/fix.sh on web-1
-# Claude calls: upload(machine="web-1", local_path="./fix.sh", remote_path="/tmp/fix.sh")
+# Claude calls: upload(host="web-1", local_path="./fix.sh", remote_path="/tmp/fix.sh")
 ```
+
+### Staged scripts
+
+Use `run_script` for heredocs, installers, tmux launch wrappers, and anything
+with complex quoting. The script body is uploaded through SFTP, then ssh-fleet
+runs a short command such as `bash /tmp/ssh-fleet-runner-...`.
+
+```
+> run this installer wrapper on alfa in tmux and log it to /tmp/wizinst.log
+# Claude calls: run_script(
+#   host="alfa",
+#   script="bash /tmp/install.sh ...",
+#   sudo=True,
+#   tmux_session="wizinst",
+#   log_path="/tmp/wizinst.log",
+#   env={"WIZ_SSH_PASS": "..."},
+# )
+```
+
+For secrets, prefer passing them in `env` and keep `keep_script=False` so the
+temporary runner is removed when it exits:
+
+```
+# Claude calls: run_script(host="alfa", script="bash /tmp/install.sh ...",
+#                          env={"WIZ_SSH_PASS": "..."})
+```
+
+### Remote tmux control
+
+Use the tmux tools when an agent needs a durable remote terminal instead of a
+single command. This is the closest ssh-fleet gives Claude Code or Codex to a
+native remote CLI session.
+
+```
+> start a root tmux terminal on alfa
+# Claude calls: tmux_new(host="alfa", session="work_1", command="bash")
+
+> run a command in that tmux terminal
+# Claude calls: tmux_paste(host="alfa", target="work_1",
+#                          text="kubectl get pods -A\n")
+
+> show me what happened
+# Claude calls: tmux_capture(host="alfa", target="work_1", lines=120)
+
+> wait until the pod table appears
+# Claude calls: tmux_wait(host="alfa", target="work_1", pattern="NAME", timeout=30)
+
+> interrupt it
+# Claude calls: tmux_send_keys(host="alfa", target="work_1", keys="C-c")
+
+> close the session
+# Claude calls: tmux_kill(host="alfa", target="work_1")
+```
+
+`tmux_paste` stages text through SFTP before loading it into a tmux buffer, so
+quotes, dollar signs, heredocs, and multiline commands are not embedded in the
+SSH command string. Use `tmux_send_keys` only for control keys.
 
 ### Guide rendering
 
@@ -178,7 +250,7 @@ Animation parameters:
 ### Dynamic machines
 ```
 > add a temporary machine called test-box at 192.168.5.10, user admin, password secret
-# Claude calls: add_machine(hostname="test-box", ip="192.168.5.10", username="admin", password="secret")
+# Claude calls: add_host(hostname="test-box", ip="192.168.5.10", username="admin", password="secret")
 # Machine is available immediately, gone when session ends
 ```
 

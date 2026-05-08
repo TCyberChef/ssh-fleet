@@ -38,11 +38,15 @@ mcp_server = FastMCP(
     instructions=(
         "SSH access to a fleet of remote machines. Use for running commands"
         " (exec, sudo_exec), persistent root shells (shell_open/run/close),"
-        " file operations (read_file, upload, download), and machine inventory"
+        " file operations (read_file, write_file, upload, download), staged"
+        " script execution (run_script), remote tmux terminal control"
+        " (tmux_new/list/capture/wait/paste/send_keys/kill), and machine inventory"
         " (list_machines, add_host, reload_machines)."
         " The 'host' parameter accepts hostname OR IP address."
         " IMPORTANT: Use sudo_exec (not exec) for kubectl, systemctl, and"
         " most system commands - regular users typically lack permissions."
+        " IMPORTANT: Use run_script instead of sudo_exec for heredocs, long"
+        " scripts, tmux launch wrappers, or commands with complex quoting."
     ),
 )
 
@@ -676,6 +680,51 @@ async def read_file(host: str, remote_path: str, max_bytes: int = 1048576) -> st
 
 
 @mcp_server.tool()
+async def write_file(host: str, remote_path: str, content: str,
+                     sudo: bool = False, mode: str = "0644",
+                     owner: str = "", timeout: int = 60) -> str:
+    """Write text content to a remote file without shell heredocs.
+
+    This is the safe MCP-compatible way to create remote files from Claude Code
+    or Codex. The content is transferred through SFTP. With sudo=true, content
+    is staged under /tmp and installed into place with a short root command, so
+    the file body is not embedded in a fragile shell string.
+
+    Args:
+        host: Hostname or IP of the target machine (case-insensitive)
+        remote_path: Absolute path to write on the remote machine
+        content: UTF-8 text content to write
+        sudo: Install as root after SFTP staging (default false)
+        mode: Octal file mode such as 0644, 0600, or 0755
+        owner: Optional owner or owner:group, requires sudo=true
+        timeout: Seconds before timeout for the sudo install step
+    """
+    m = store.get(host)
+    if not m:
+        return (
+            f"ERROR: Machine '{host}' not found."
+            " Use list_machines to see available machines."
+        )
+    try:
+        size = await pool.write_file(
+            m,
+            remote_path,
+            content,
+            sudo=sudo,
+            mode=mode,
+            owner=owner or None,
+            timeout=timeout,
+        )
+        return f"Wrote {size:,} bytes to {host}:{remote_path}"
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except PermissionError:
+        return f"ERROR: Permission denied writing to {remote_path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
 async def upload(host: str, local_path: str, remote_path: str) -> str:
     """Upload a local file to a remote machine via SFTP.
 
@@ -720,6 +769,322 @@ async def download(host: str, remote_path: str, local_path: str) -> str:
         return f"ERROR: {e}"
     except FileNotFoundError:
         return f"ERROR: Remote file not found: {remote_path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def _format_run_script_result(host: str, script_result) -> str:
+    """Format staged script output for MCP clients without dumping metadata noise."""
+    result = script_result.result
+    if script_result.tmux_session:
+        if result.exit_code != 0 or result.error:
+            return result.format()
+
+        lines = [
+            (
+                f"Launched script in tmux session "
+                f"'{script_result.tmux_session}' on {host}."
+            ),
+        ]
+        if script_result.log_path:
+            lines.extend([
+                f"log_path: {script_result.log_path}",
+                f"follow_log: tail -f {script_result.log_path}",
+            ])
+        lines.append(f"attach: tmux attach -t {script_result.tmux_session}")
+        if script_result.kept:
+            lines.extend([
+                f"script_path: {script_result.script_path}",
+                f"runner_path: {script_result.runner_path}",
+            ])
+        return "\n".join(lines)
+
+    lines = [result.format()]
+    if script_result.log_path:
+        lines.append(f"log_path: {script_result.log_path}")
+    if script_result.kept:
+        lines.extend([
+            f"script_path: {script_result.script_path}",
+            f"runner_path: {script_result.runner_path}",
+        ])
+    return "\n".join(lines)
+
+
+@mcp_server.tool()
+async def run_script(host: str, script: str, sudo: bool = True,
+                     timeout: int = 60, tmux_session: Optional[str] = None,
+                     log_path: Optional[str] = None, env: Optional[dict] = None,
+                     keep_script: bool = False) -> str:
+    """Stage and run a bash script on a remote machine.
+
+    Use this instead of exec/sudo_exec for heredocs, multi-line scripts, tmux
+    launch wrappers, installers, or commands with complex quoting. The script
+    body and small runner are transferred through SFTP, then ssh-fleet executes
+    only a short command. This avoids JSON/string/newline escaping failures in
+    Claude Code and other MCP clients.
+
+    Args:
+        host: Hostname or IP of the target machine (case-insensitive)
+        script: Bash script content to stage and run
+        sudo: Run as root through sudo (default true)
+        timeout: Seconds before timeout for synchronous runs or tmux launch
+        tmux_session: Optional tmux session name. If set, launch and return.
+        log_path: Optional absolute path for tee'd output and EXIT marker
+        env: Optional JSON object of environment variables for the script
+        keep_script: Keep staged files after completion. If env contains
+            secrets, leave this false.
+    """
+    m = store.get(host)
+    if not m:
+        return (
+            f"ERROR: Machine '{host}' not found."
+            " Use list_machines to see available machines."
+        )
+    if env is not None and not isinstance(env, dict):
+        return "ERROR: env must be a JSON object of KEY: value pairs"
+
+    try:
+        result = await pool.run_script(
+            m,
+            script,
+            sudo=sudo,
+            timeout=timeout,
+            tmux_session=tmux_session or None,
+            log_path=log_path or None,
+            env=env,
+            keep_script=keep_script,
+        )
+        return _format_run_script_result(host, result)
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def _machine_or_error(host: str):
+    m = store.get(host)
+    if not m:
+        return None, (
+            f"ERROR: Machine '{host}' not found."
+            " Use list_machines to see available machines."
+        )
+    return m, ""
+
+
+@mcp_server.tool()
+async def tmux_new(host: str, session: str, command: str = "",
+                   cwd: str = "", sudo: bool = True,
+                   timeout: int = 30) -> str:
+    """Create a detached tmux session on a remote machine.
+
+    Use this when an agent needs a durable remote terminal it can control over
+    multiple MCP calls. Start an empty shell by leaving command blank, or start
+    a command like "bash" or "top". Follow with tmux_capture, tmux_paste, and
+    tmux_send_keys.
+
+    Args:
+        host: Hostname or IP of the target machine
+        session: tmux session name, letters/numbers/._:- only
+        command: Optional command to run in the session
+        cwd: Optional absolute working directory for the session
+        sudo: Create the tmux session as root via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_new(
+            m, session, command=command, cwd=cwd, sudo=sudo, timeout=timeout
+        )
+        if result.exit_code == 0:
+            return f"Started tmux session '{session}' on {host}."
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_list(host: str, sudo: bool = True, timeout: int = 20) -> str:
+    """List tmux sessions on a remote machine.
+
+    Output columns are: session name, window count, attached count, created time.
+    Args:
+        host: Hostname or IP of the target machine
+        sudo: List root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_list(m, sudo=sudo, timeout=timeout)
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_capture(host: str, target: str, lines: int = 200,
+                       sudo: bool = True, timeout: int = 20) -> str:
+    """Capture recent output from a remote tmux pane.
+
+    Use this as the main observation tool after tmux_new, tmux_paste, or
+    tmux_send_keys. Target can be a session, session:window.pane, or %pane id.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux target such as session, session:0.0, or %1
+        lines: Number of recent lines to capture
+        sudo: Capture root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_capture(
+            m, target, lines=lines, sudo=sudo, timeout=timeout
+        )
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_wait(host: str, target: str, pattern: str,
+                    regex: bool = False, timeout: int = 60,
+                    interval: float = 1.0, lines: int = 200,
+                    sudo: bool = True) -> str:
+    """Wait until text appears in a remote tmux pane.
+
+    Use this after tmux_paste or tmux_send_keys when an agent needs to wait for
+    a prompt, completion message, menu, or error before deciding the next step.
+    Returns the latest captured pane output with MATCHED or TIMEOUT status.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux target such as session, session:0.0, or %1
+        pattern: Literal text or regex to wait for
+        regex: Treat pattern as a Python regex instead of literal text
+        timeout: Maximum seconds to wait
+        interval: Seconds between captures
+        lines: Number of recent lines to capture each poll
+        sudo: Capture root-owned tmux sessions via sudo (default true)
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_wait(
+            m,
+            target,
+            pattern,
+            regex=regex,
+            timeout=timeout,
+            interval=interval,
+            lines=lines,
+            sudo=sudo,
+        )
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_paste(host: str, target: str, text: str,
+                     enter: bool = False, sudo: bool = True,
+                     timeout: int = 20) -> str:
+    """Paste arbitrary text into a remote tmux pane.
+
+    Text is staged through SFTP as a tmux buffer, so quotes, dollar signs,
+    heredocs, and multiline commands are not embedded in the SSH command.
+    Set enter=true to send Enter after the paste.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux target such as session, session:0.0, or %1
+        text: Text to paste into the pane
+        enter: Send Enter after pasting (default false)
+        sudo: Paste into root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_paste(
+            m, target, text, enter=enter, sudo=sudo, timeout=timeout
+        )
+        if result.exit_code == 0:
+            return f"Pasted {len(text)} characters to tmux target '{target}' on {host}."
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_send_keys(host: str, target: str, keys: str,
+                         sudo: bool = True, timeout: int = 20) -> str:
+    """Send tmux key tokens to a remote pane.
+
+    Use this for controls like C-c, Enter, Up, Down, or C-m. For normal text,
+    especially text with spaces or shell metacharacters, use tmux_paste.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux target such as session, session:0.0, or %1
+        keys: Whitespace-separated tmux key tokens, for example "C-c" or "Enter"
+        sudo: Send keys to root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_send_keys(
+            m, target, keys, sudo=sudo, timeout=timeout
+        )
+        if result.exit_code == 0:
+            return f"Sent keys to tmux target '{target}' on {host}: {keys}"
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_kill(host: str, target: str,
+                    sudo: bool = True, timeout: int = 20) -> str:
+    """Kill a remote tmux session.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux session target to kill
+        sudo: Kill root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_kill(m, target, sudo=sudo, timeout=timeout)
+        if result.exit_code == 0:
+            return f"Killed tmux target '{target}' on {host}."
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
     except Exception as e:
         return f"ERROR: {e}"
 

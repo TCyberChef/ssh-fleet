@@ -118,6 +118,240 @@ def test_read_remote_file_text():
     assert "line 2" in result
 
 
+def test_write_file_non_sudo_writes_content_and_mode_via_sftp():
+    conn = _mock_connected_conn()
+    mock_sftp = MagicMock()
+    mock_file = MagicMock()
+    mock_file.__enter__ = lambda s: s
+    mock_file.__exit__ = MagicMock(return_value=False)
+    mock_sftp.open.return_value = mock_file
+    conn._sftp = mock_sftp
+
+    written = conn.write_file("/tmp/example.conf", "hello\nworld\n", mode="0600")
+
+    assert written == len("hello\nworld\n".encode())
+    mock_sftp.open.assert_called_once_with("/tmp/example.conf", "wb")
+    mock_file.write.assert_called_once_with(b"hello\nworld\n")
+    mock_sftp.chmod.assert_called_once_with("/tmp/example.conf", 0o600)
+
+
+def test_write_file_sudo_stages_then_installs_without_heredoc_or_content():
+    conn = _mock_connected_conn()
+    mock_sftp = MagicMock()
+    mock_file = MagicMock()
+    mock_file.__enter__ = lambda s: s
+    mock_file.__exit__ = MagicMock(return_value=False)
+    mock_sftp.open.return_value = mock_file
+    conn._sftp = mock_sftp
+
+    conn.write_file("/etc/example.conf", "SECRET=value\n", sudo=True, mode="0640", owner="root:root")
+
+    mock_file.write.assert_called_once_with(b"SECRET=value\n")
+    remote_cmd = conn._client.exec_command.call_args[0][0]
+    assert "install -D" in remote_cmd
+    assert "/etc/example.conf" in remote_cmd
+    assert "root" in remote_cmd
+    assert "SECRET=value" not in remote_cmd
+    assert "cat >" not in remote_cmd
+    assert "<<" not in remote_cmd
+
+
+def test_run_script_sync_uses_uploaded_files_not_inline_script_or_env_values():
+    conn = _mock_connected_conn()
+    mock_sftp = MagicMock()
+    written_files = {}
+
+    def fake_open(path, mode):
+        mock_file = MagicMock()
+        mock_file.__enter__ = lambda s: s
+        mock_file.__exit__ = MagicMock(return_value=False)
+        mock_file.write.side_effect = lambda data: written_files.setdefault(path, b"") or written_files.__setitem__(path, data)
+        return mock_file
+
+    mock_sftp.open.side_effect = fake_open
+    conn._sftp = mock_sftp
+
+    result = conn.run_script(
+        "echo hello\necho world\n",
+        sudo=True,
+        timeout=120,
+        log_path="/tmp/wizinst.log",
+        env={"WIZ_SSH_PASS": "user1!"},
+    )
+
+    assert result.result.exit_code == 0
+    assert result.log_path == "/tmp/wizinst.log"
+    assert len(written_files) == 2
+    written_text = "\n".join(data.decode() for data in written_files.values())
+    assert "echo hello" in written_text
+    assert "export WIZ_SSH_PASS=" in written_text
+    assert "PIPESTATUS" in written_text
+
+    remote_cmd = conn._client.exec_command.call_args[0][0]
+    assert "bash /tmp/ssh-fleet-runner-" in remote_cmd
+    assert "echo hello" not in remote_cmd
+    assert "user1!" not in remote_cmd
+    assert "cat >" not in remote_cmd
+    assert "<<" not in remote_cmd
+
+
+def test_run_script_tmux_launches_small_command_and_defaults_log_path():
+    conn = _mock_connected_conn()
+    mock_sftp = MagicMock()
+    mock_file = MagicMock()
+    mock_file.__enter__ = lambda s: s
+    mock_file.__exit__ = MagicMock(return_value=False)
+    mock_sftp.open.return_value = mock_file
+    conn._sftp = mock_sftp
+
+    result = conn.run_script(
+        "#!/usr/bin/env bash\necho launched\n",
+        sudo=True,
+        tmux_session="wizinst",
+    )
+
+    assert result.tmux_session == "wizinst"
+    assert result.log_path.startswith("/tmp/ssh-fleet-wizinst-")
+    remote_cmd = conn._client.exec_command.call_args[0][0]
+    assert "tmux new -d -s wizinst" in remote_cmd
+    assert "echo launched" not in remote_cmd
+    assert "cat >" not in remote_cmd
+    assert "<<" not in remote_cmd
+
+
+def test_tmux_new_builds_detached_session_command():
+    conn = _mock_connected_conn()
+
+    result = conn.tmux_new("work_1", command="bash", cwd="/opt/onwatch", sudo=True)
+
+    assert result.exit_code == 0
+    remote_cmd = conn._client.exec_command.call_args[0][0]
+    assert "tmux new-session -d -s work_1 -c /opt/onwatch bash" in remote_cmd
+
+
+def test_tmux_capture_uses_target_and_line_limit():
+    conn = _mock_connected_conn()
+
+    conn.tmux_capture("work_1:0.0", lines=80, sudo=True)
+
+    remote_cmd = conn._client.exec_command.call_args[0][0]
+    assert "tmux capture-pane -p -t work_1:0.0 -S -80" in remote_cmd
+
+
+def test_tmux_paste_writes_buffer_file_not_inline_text():
+    conn = _mock_connected_conn()
+    mock_sftp = MagicMock()
+    mock_file = MagicMock()
+    mock_file.__enter__ = lambda s: s
+    mock_file.__exit__ = MagicMock(return_value=False)
+    mock_sftp.open.return_value = mock_file
+    conn._sftp = mock_sftp
+
+    result = conn.tmux_paste(
+        "work_1",
+        "echo 'quoted text'\ncat <<'EOF'\n$HOME\nEOF\n",
+        enter=True,
+        sudo=True,
+    )
+
+    assert result.exit_code == 0
+    mock_file.write.assert_called_once_with(b"echo 'quoted text'\ncat <<'EOF'\n$HOME\nEOF\n")
+    remote_cmd = conn._client.exec_command.call_args[0][0]
+    assert "tmux load-buffer" in remote_cmd
+    assert "tmux paste-buffer" in remote_cmd
+    assert "tmux send-keys -t work_1 C-m" in remote_cmd
+    assert "quoted text" not in remote_cmd
+    assert "$HOME" not in remote_cmd
+    assert "<<" not in remote_cmd
+
+
+def test_tmux_send_keys_validates_and_sends_tokens():
+    conn = _mock_connected_conn()
+
+    conn.tmux_send_keys("work_1", "C-c Enter", sudo=True)
+
+    remote_cmd = conn._client.exec_command.call_args[0][0]
+    assert "tmux send-keys -t work_1 C-c Enter" in remote_cmd
+
+
+def test_tmux_send_keys_rejects_shell_like_keys():
+    conn = _mock_connected_conn()
+
+    with pytest.raises(ValueError, match="Invalid tmux key"):
+        conn.tmux_send_keys("work_1", "C-c;rm -rf /", sudo=True)
+
+
+def test_tmux_wait_returns_when_literal_text_appears():
+    conn = _mock_connected_conn()
+    calls = []
+
+    def fake_capture(target, lines=200, sudo=True, timeout=20):
+        calls.append((target, lines, sudo, timeout))
+        stdout = "booting..." if len(calls) == 1 else "booting...\nREADY"
+        return CommandResult(stdout=stdout, stderr="", exit_code=0)
+
+    conn.tmux_capture = fake_capture
+
+    result = conn.tmux_wait(
+        "work_1",
+        pattern="READY",
+        regex=False,
+        timeout=5,
+        interval=0.01,
+        lines=50,
+        sudo=True,
+    )
+
+    assert result.exit_code == 0
+    assert "MATCHED: READY" in result.stdout
+    assert "READY" in result.stdout
+    assert calls == [
+        ("work_1", 50, True, 20),
+        ("work_1", 50, True, 20),
+    ]
+
+
+def test_tmux_wait_times_out_with_last_capture():
+    conn = _mock_connected_conn()
+    conn.tmux_capture = lambda target, lines=200, sudo=True, timeout=20: CommandResult(
+        stdout="still waiting", stderr="", exit_code=0
+    )
+
+    result = conn.tmux_wait(
+        "work_1",
+        pattern="READY",
+        regex=False,
+        timeout=0.01,
+        interval=0.01,
+        lines=20,
+        sudo=True,
+    )
+
+    assert result.exit_code == 1
+    assert "TIMEOUT waiting for: READY" in result.stdout
+    assert "still waiting" in result.stdout
+
+
+def test_tmux_wait_supports_regex():
+    conn = _mock_connected_conn()
+    conn.tmux_capture = lambda target, lines=200, sudo=True, timeout=20: CommandResult(
+        stdout="progress 100%", stderr="", exit_code=0
+    )
+
+    result = conn.tmux_wait(
+        "work_1",
+        pattern=r"progress \d+%",
+        regex=True,
+        timeout=1,
+        interval=0.01,
+        lines=20,
+        sudo=True,
+    )
+
+    assert result.exit_code == 0
+    assert "MATCHED: progress \\d+%" in result.stdout
+
+
 # --- Login shell wrapping tests ---
 
 def _mock_connected_conn():
