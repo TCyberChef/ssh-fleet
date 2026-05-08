@@ -4,7 +4,10 @@ import logging
 import time
 from typing import Optional
 
-from ssh_fleet.ssh import SSHConnection, SSHConnectionError, SSHAuthError, CommandResult, SudoShell
+from ssh_fleet.ssh import (
+    SSHConnection, SSHConnectionError, SSHAuthError, CommandResult,
+    ScriptRunResult, SudoShell,
+)
 from ssh_fleet.machines import Machine
 
 logger = logging.getLogger("ssh-fleet")
@@ -139,6 +142,205 @@ class ConnectionPool:
         async with lock:
             conn = await asyncio.to_thread(self._get_or_create, machine)
             return await asyncio.to_thread(conn.read_remote_file, remote_path, max_bytes)
+
+    async def write_file(
+        self,
+        machine: Machine,
+        remote_path: str,
+        content: str,
+        sudo: bool = False,
+        mode: str = "0644",
+        owner: Optional[str] = None,
+        timeout: int = 60,
+    ) -> int:
+        """Write text content to a remote file via SFTP staging."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(
+                conn.write_file,
+                remote_path,
+                content,
+                sudo,
+                mode,
+                owner,
+                timeout,
+            )
+
+    async def run_script(
+        self,
+        machine: Machine,
+        script: str,
+        sudo: bool = True,
+        timeout: int = 60,
+        tmux_session: Optional[str] = None,
+        log_path: Optional[str] = None,
+        env: Optional[dict[str, object]] = None,
+        keep_script: bool = False,
+    ) -> ScriptRunResult:
+        """Stage and run a remote bash script through SFTP-backed files."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(
+                conn.run_script,
+                script,
+                sudo,
+                timeout,
+                tmux_session,
+                log_path,
+                env,
+                keep_script,
+            )
+
+    async def tmux_new(
+        self,
+        machine: Machine,
+        session: str,
+        command: str = "",
+        cwd: str = "",
+        sudo: bool = True,
+        timeout: int = 30,
+    ) -> CommandResult:
+        """Create a detached tmux session on a machine."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(
+                conn.tmux_new,
+                session,
+                command,
+                cwd,
+                sudo,
+                timeout,
+            )
+
+    async def tmux_list(
+        self,
+        machine: Machine,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """List tmux sessions on a machine."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(conn.tmux_list, sudo, timeout)
+
+    async def tmux_capture(
+        self,
+        machine: Machine,
+        target: str,
+        lines: int = 200,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """Capture tmux pane output on a machine."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(
+                conn.tmux_capture,
+                target,
+                lines,
+                sudo,
+                timeout,
+            )
+
+    async def tmux_wait(
+        self,
+        machine: Machine,
+        target: str,
+        pattern: str,
+        regex: bool = False,
+        timeout: int = 60,
+        interval: float = 1.0,
+        lines: int = 200,
+        sudo: bool = True,
+    ) -> CommandResult:
+        """Wait for a string or regex to appear in a tmux pane."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(
+                conn.tmux_wait,
+                target,
+                pattern,
+                regex,
+                timeout,
+                interval,
+                lines,
+                sudo,
+            )
+
+    async def tmux_paste(
+        self,
+        machine: Machine,
+        target: str,
+        text: str,
+        enter: bool = False,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """Paste arbitrary text into a remote tmux pane."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(
+                conn.tmux_paste,
+                target,
+                text,
+                enter,
+                sudo,
+                timeout,
+            )
+
+    async def tmux_send_keys(
+        self,
+        machine: Machine,
+        target: str,
+        keys: str,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """Send tmux key tokens to a remote pane."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(
+                conn.tmux_send_keys,
+                target,
+                keys,
+                sudo,
+                timeout,
+            )
+
+    async def tmux_kill(
+        self,
+        machine: Machine,
+        target: str,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """Kill a tmux session on a machine."""
+        key = machine.hostname.lower()
+        lock = self._get_lock(key)
+        async with lock:
+            conn = await asyncio.to_thread(self._get_or_create, machine)
+            return await asyncio.to_thread(
+                conn.tmux_kill,
+                target,
+                sudo,
+                timeout,
+            )
 
     async def upload(self, machine: Machine, local_path: str, remote_path: str) -> int:
         """Upload a local file to remote via SFTP. Returns bytes."""

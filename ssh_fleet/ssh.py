@@ -6,6 +6,7 @@ import re
 import shlex
 import socket
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Optional
 
@@ -47,6 +48,17 @@ class CommandResult:
         if self.exit_code != 0 and not self.stdout and not self.stderr:
             parts.append("(no output)")
         return "\n".join(parts)
+
+
+@dataclass
+class ScriptRunResult:
+    """Result and metadata for a staged remote script run."""
+    result: CommandResult
+    script_path: str
+    runner_path: str
+    log_path: Optional[str] = None
+    tmux_session: Optional[str] = None
+    kept: bool = False
 
 
 def _format_output(text: str, max_chars: int = 50000) -> str:
@@ -110,6 +122,132 @@ def strip_sudo_prompt(output: str) -> str:
     while cleaned and not cleaned[0].strip():
         cleaned.pop(0)
     return "\n".join(cleaned)
+
+
+_MODE_RE = re.compile(r"^[0-7]{3,4}$")
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TMUX_SESSION_RE = re.compile(r"^[A-Za-z0-9_.:-]+$")
+_TMUX_TARGET_RE = re.compile(r"^[A-Za-z0-9_.:%-]+$")
+_TMUX_KEY_RE = re.compile(r"^[A-Za-z0-9_:+-]+$")
+
+
+def _validate_mode(mode: str) -> str:
+    mode = str(mode)
+    if not _MODE_RE.match(mode):
+        raise ValueError(f"Invalid mode '{mode}'. Use octal like 0644 or 600.")
+    return mode
+
+
+def _require_absolute_path(path: str, label: str) -> str:
+    if not path or not path.startswith("/"):
+        raise ValueError(f"{label} must be an absolute remote path")
+    return path
+
+
+def _remote_tmp_path(prefix: str, suffix: str = "") -> str:
+    return f"/tmp/{prefix}-{uuid.uuid4().hex}{suffix}"
+
+
+def _install_owner_args(owner: Optional[str]) -> list[str]:
+    if not owner:
+        return []
+    if not owner.strip():
+        raise ValueError("owner cannot be blank")
+
+    args: list[str] = []
+    if ":" in owner:
+        user, group = owner.split(":", 1)
+        if user:
+            args.extend(["-o", user])
+        if group:
+            args.extend(["-g", group])
+    else:
+        args.extend(["-o", owner])
+    return args
+
+
+def _normalize_env(env: Optional[dict[str, object]]) -> dict[str, str]:
+    if not env:
+        return {}
+    normalized: dict[str, str] = {}
+    for key, value in env.items():
+        if not _ENV_NAME_RE.match(str(key)):
+            raise ValueError(f"Invalid env var name '{key}'")
+        normalized[str(key)] = "" if value is None else str(value)
+    return normalized
+
+
+def _validate_tmux_session(tmux_session: Optional[str]) -> Optional[str]:
+    if tmux_session is None:
+        return None
+    if not _TMUX_SESSION_RE.match(tmux_session):
+        raise ValueError(
+            "tmux_session may only contain letters, numbers, '.', '_', ':', and '-'"
+        )
+    return tmux_session
+
+
+def _validate_tmux_target(target: str) -> str:
+    if not target or not _TMUX_TARGET_RE.match(target):
+        raise ValueError(
+            "tmux target may only contain letters, numbers, '.', '_', ':', '%', and '-'"
+        )
+    return target
+
+
+def _validate_tmux_keys(keys: str) -> list[str]:
+    tokens = keys.split()
+    if not tokens:
+        raise ValueError("keys cannot be empty")
+    for token in tokens:
+        if not _TMUX_KEY_RE.match(token):
+            raise ValueError(f"Invalid tmux key '{token}'")
+    return tokens
+
+
+def _safe_log_slug(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+    return slug or "script"
+
+
+def _build_runner_script(
+    script_path: str,
+    log_path: Optional[str],
+    env: dict[str, str],
+    keep_script: bool,
+) -> str:
+    """Build a tiny remote runner that executes the uploaded script."""
+    lines = [
+        "#!/usr/bin/env bash",
+        "set -o pipefail",
+        f"SSH_FLEET_SCRIPT={shlex.quote(script_path)}",
+        f"SSH_FLEET_KEEP_SCRIPT={shlex.quote('1' if keep_script else '0')}",
+        "cleanup() {",
+        '  if [ "$SSH_FLEET_KEEP_SCRIPT" != "1" ]; then',
+        '    rm -f -- "$SSH_FLEET_SCRIPT" "$0"',
+        "  fi",
+        "}",
+        "trap cleanup EXIT",
+    ]
+
+    for key, value in env.items():
+        lines.append(f"export {key}={shlex.quote(value)}")
+
+    if log_path:
+        lines.extend([
+            f"SSH_FLEET_LOG={shlex.quote(log_path)}",
+            'bash "$SSH_FLEET_SCRIPT" 2>&1 | tee "$SSH_FLEET_LOG"',
+            "SSH_FLEET_EXIT=${PIPESTATUS[0]}",
+            'echo "EXIT=$SSH_FLEET_EXIT" >> "$SSH_FLEET_LOG"',
+            'exit "$SSH_FLEET_EXIT"',
+        ])
+    else:
+        lines.extend([
+            'bash "$SSH_FLEET_SCRIPT"',
+            'exit "$?"',
+        ])
+
+    return "\n".join(lines) + "\n"
 
 
 class SSHConnectionError(Exception):
@@ -266,6 +404,56 @@ class SSHConnection:
             text += f"\n\n[TRUNCATED at {max_bytes} bytes]"
         return text
 
+    def _write_bytes(self, remote_path: str, data: bytes, mode: str) -> int:
+        """Write bytes through SFTP and chmod the result."""
+        mode = _validate_mode(mode)
+        _require_absolute_path(remote_path, "remote_path")
+        with self.sftp.open(remote_path, "wb") as f:
+            f.write(data)
+        self.sftp.chmod(remote_path, int(mode, 8))
+        return len(data)
+
+    def write_file(
+        self,
+        remote_path: str,
+        content: str,
+        sudo: bool = False,
+        mode: str = "0644",
+        owner: Optional[str] = None,
+        timeout: int = 60,
+    ) -> int:
+        """Write text content to a remote file without shell heredocs.
+
+        Non-sudo writes go straight through SFTP. Sudo writes stage content
+        under /tmp via SFTP, then use a short root install command to move it
+        into place. The file content is never embedded in the executed shell
+        command.
+        """
+        if not self.is_connected:
+            raise SSHConnectionError(f"Not connected to {self.ip}")
+
+        mode = _validate_mode(mode)
+        _require_absolute_path(remote_path, "remote_path")
+        data = content.encode("utf-8")
+
+        if not sudo:
+            if owner:
+                raise ValueError("owner requires sudo=True")
+            return self._write_bytes(remote_path, data, mode)
+
+        temp_path = _remote_tmp_path("ssh-fleet-write", ".tmp")
+        self._write_bytes(temp_path, data, "0600")
+
+        install_args = ["install", "-D", "-m", mode]
+        install_args.extend(_install_owner_args(owner))
+        install_args.extend([temp_path, remote_path])
+        install_cmd = shlex.join(install_args)
+        cleanup = f"rc=$?; rm -f -- {shlex.quote(temp_path)}; exit $rc"
+        result = self.run_sudo(f"{install_cmd}; {cleanup}", timeout=timeout)
+        if result.exit_code != 0:
+            raise SSHConnectionError(f"sudo install failed: {result.format()}")
+        return len(data)
+
     def upload_file(self, local_path: str, remote_path: str) -> int:
         """Upload a local file to remote via SFTP. Returns bytes transferred."""
         import os
@@ -278,6 +466,219 @@ class SSHConnection:
         os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
         self.sftp.get(remote_path, local_path)
         return os.path.getsize(local_path)
+
+    def run_script(
+        self,
+        script: str,
+        sudo: bool = True,
+        timeout: int = 60,
+        tmux_session: Optional[str] = None,
+        log_path: Optional[str] = None,
+        env: Optional[dict[str, object]] = None,
+        keep_script: bool = False,
+    ) -> ScriptRunResult:
+        """Stage and run a remote bash script without inline heredocs.
+
+        The script body and runner are written via SFTP. The SSH exec path only
+        runs a short command like ``bash /tmp/ssh-fleet-runner-...`` or
+        ``tmux new -d -s ... /tmp/ssh-fleet-runner-...``.
+        """
+        if not self.is_connected:
+            raise SSHConnectionError(f"Not connected to {self.ip}")
+        if not script:
+            raise ValueError("script cannot be empty")
+
+        tmux_session = _validate_tmux_session(tmux_session)
+        env_vars = _normalize_env(env)
+        if log_path:
+            _require_absolute_path(log_path, "log_path")
+
+        script_id = uuid.uuid4().hex
+        script_path = f"/tmp/ssh-fleet-script-{script_id}.sh"
+        runner_path = f"/tmp/ssh-fleet-runner-{script_id}.sh"
+        if tmux_session and not log_path:
+            log_path = f"/tmp/ssh-fleet-{_safe_log_slug(tmux_session)}-{script_id}.log"
+
+        script_text = script if script.endswith("\n") else script + "\n"
+        runner = _build_runner_script(
+            script_path=script_path,
+            log_path=log_path,
+            env=env_vars,
+            keep_script=keep_script,
+        )
+
+        self._write_bytes(script_path, script_text.encode("utf-8"), "0700")
+        self._write_bytes(runner_path, runner.encode("utf-8"), "0700")
+
+        if tmux_session:
+            command = shlex.join(["tmux", "new", "-d", "-s", tmux_session, runner_path])
+        else:
+            command = shlex.join(["bash", runner_path])
+
+        result = self.run_sudo(command, timeout=timeout) if sudo else self.run(command, timeout=timeout)
+        return ScriptRunResult(
+            result=result,
+            script_path=script_path,
+            runner_path=runner_path,
+            log_path=log_path,
+            tmux_session=tmux_session,
+            kept=keep_script,
+        )
+
+    def _run_tmux_command(self, args: list[str], sudo: bool, timeout: int) -> CommandResult:
+        """Run a short tmux command through exec or sudo_exec."""
+        command = shlex.join(args)
+        return self.run_sudo(command, timeout=timeout) if sudo else self.run(command, timeout=timeout)
+
+    def tmux_new(
+        self,
+        session: str,
+        command: str = "",
+        cwd: str = "",
+        sudo: bool = True,
+        timeout: int = 30,
+    ) -> CommandResult:
+        """Create a detached tmux session on the remote machine."""
+        _validate_tmux_session(session)
+        args = ["tmux", "new-session", "-d", "-s", session]
+        if cwd:
+            _require_absolute_path(cwd, "cwd")
+            args.extend(["-c", cwd])
+        if command:
+            args.append(command)
+        return self._run_tmux_command(args, sudo=sudo, timeout=timeout)
+
+    def tmux_list(self, sudo: bool = True, timeout: int = 20) -> CommandResult:
+        """List remote tmux sessions in a compact tab-separated format."""
+        return self._run_tmux_command(
+            [
+                "tmux",
+                "list-sessions",
+                "-F",
+                "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created_string}",
+            ],
+            sudo=sudo,
+            timeout=timeout,
+        )
+
+    def tmux_capture(
+        self,
+        target: str,
+        lines: int = 200,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """Capture recent output from a tmux pane."""
+        _validate_tmux_target(target)
+        if lines < 1:
+            raise ValueError("lines must be >= 1")
+        return self._run_tmux_command(
+            ["tmux", "capture-pane", "-p", "-t", target, "-S", f"-{lines}"],
+            sudo=sudo,
+            timeout=timeout,
+        )
+
+    def tmux_wait(
+        self,
+        target: str,
+        pattern: str,
+        regex: bool = False,
+        timeout: int = 60,
+        interval: float = 1.0,
+        lines: int = 200,
+        sudo: bool = True,
+    ) -> CommandResult:
+        """Poll a tmux pane until a literal string or regex appears."""
+        _validate_tmux_target(target)
+        if pattern == "":
+            raise ValueError("pattern cannot be empty")
+        if timeout < 1:
+            deadline = time.time() + timeout
+        else:
+            deadline = time.time() + int(timeout)
+        if interval <= 0:
+            raise ValueError("interval must be > 0")
+
+        compiled = re.compile(pattern) if regex else None
+        last_output = ""
+        while True:
+            result = self.tmux_capture(target, lines=lines, sudo=sudo)
+            if result.error or result.exit_code != 0:
+                return result
+            last_output = result.stdout
+            matched = compiled.search(last_output) is not None if compiled else pattern in last_output
+            if matched:
+                return CommandResult(
+                    stdout=f"MATCHED: {pattern}\n{last_output}",
+                    stderr="",
+                    exit_code=0,
+                )
+            if time.time() >= deadline:
+                return CommandResult(
+                    stdout=f"TIMEOUT waiting for: {pattern}\n{last_output}",
+                    stderr="",
+                    exit_code=1,
+                )
+            time.sleep(min(interval, max(0, deadline - time.time())))
+
+    def tmux_paste(
+        self,
+        target: str,
+        text: str,
+        enter: bool = False,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """Paste arbitrary text into a tmux pane via an SFTP-backed buffer."""
+        _validate_tmux_target(target)
+        if text == "":
+            raise ValueError("text cannot be empty")
+
+        buffer_path = _remote_tmp_path("ssh-fleet-tmux-buffer", ".txt")
+        buffer_name = f"ssh_fleet_{uuid.uuid4().hex}"
+        self._write_bytes(buffer_path, text.encode("utf-8"), "0600")
+
+        commands = [
+            shlex.join(["tmux", "load-buffer", "-b", buffer_name, buffer_path]),
+            shlex.join(["tmux", "paste-buffer", "-b", buffer_name, "-t", target]),
+            shlex.join(["tmux", "delete-buffer", "-b", buffer_name]),
+        ]
+        if enter:
+            commands.append(shlex.join(["tmux", "send-keys", "-t", target, "C-m"]))
+        command = " && ".join(commands)
+        cleanup = f"rc=$?; rm -f -- {shlex.quote(buffer_path)}; exit $rc"
+        result_command = f"{command}; {cleanup}"
+        return self.run_sudo(result_command, timeout=timeout) if sudo else self.run(result_command, timeout=timeout)
+
+    def tmux_send_keys(
+        self,
+        target: str,
+        keys: str,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """Send tmux key tokens such as C-c, Enter, Up, or C-m."""
+        _validate_tmux_target(target)
+        key_tokens = _validate_tmux_keys(keys)
+        return self._run_tmux_command(
+            ["tmux", "send-keys", "-t", target, *key_tokens],
+            sudo=sudo,
+            timeout=timeout,
+        )
+
+    def tmux_kill(
+        self,
+        target: str,
+        sudo: bool = True,
+        timeout: int = 20,
+    ) -> CommandResult:
+        """Kill a remote tmux session."""
+        _validate_tmux_target(target)
+        return self._run_tmux_command(
+            ["tmux", "kill-session", "-t", target],
+            sudo=sudo,
+            timeout=timeout,
+        )
 
 
 def _strip_ansi(text: str) -> str:

@@ -128,8 +128,46 @@ def test_store_add_permanent_duplicate_rejected(tmp_path):
     auth_file.write_text("web-1\t192.168.1.10\tadmin:pass\n")
     store = MachineStore()
     store.load_from_file(auth_file)
-    with pytest.raises(ValueError, match="already exists"):
+    with pytest.raises(ValueError, match="overwrite=True"):
         store.add_permanent("web-1", "192.168.1.20", "admin", password="x", auth_file=auth_file)
+
+
+def test_store_add_permanent_overwrite_replaces_hostname(tmp_path):
+    auth_file = tmp_path / "hosts.txt"
+    auth_file.write_text(
+        "# lab machines\n"
+        "web-1\t192.168.1.10\tadmin:oldpass\n"
+        "db-1\t192.168.1.20\tadmin:dbpass\n"
+    )
+    store = MachineStore()
+    store.load_from_file(auth_file)
+    m = store.add_permanent("web-1", "192.168.2.50", "admin", password="newpass",
+                            auth_file=auth_file, overwrite=True)
+    assert m.ip == "192.168.2.50"
+    content = auth_file.read_text()
+    # Old web-1 row gone, new one written, comment + db-1 preserved
+    assert "192.168.1.10" not in content
+    assert "web-1\t192.168.2.50\tadmin:newpass" in content
+    assert "# lab machines" in content
+    assert "db-1\t192.168.1.20\tadmin:dbpass" in content
+    # Store reflects new IP
+    assert store.get("web-1").ip == "192.168.2.50"
+
+
+def test_store_add_permanent_overwrite_replaces_ip(tmp_path):
+    """Different building, same IP reused: hostname differs, IP collides."""
+    auth_file = tmp_path / "hosts.txt"
+    auth_file.write_text("alpha\t172.0.0.1\tadmin:passA\n")
+    store = MachineStore()
+    store.load_from_file(auth_file)
+    store.add_permanent("beta", "172.0.0.1", "admin", password="passB",
+                        auth_file=auth_file, overwrite=True)
+    content = auth_file.read_text()
+    # Old alpha row gone (its IP collided), beta is the only 172.0.0.1 row
+    assert content.count("172.0.0.1") == 1
+    assert "beta\t172.0.0.1\tadmin:passB" in content
+    assert store.get("alpha") is None
+    assert store.get("beta").ip == "172.0.0.1"
 
 
 def test_store_add_permanent_no_auth_file():

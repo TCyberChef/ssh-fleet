@@ -38,11 +38,15 @@ mcp_server = FastMCP(
     instructions=(
         "SSH access to a fleet of remote machines. Use for running commands"
         " (exec, sudo_exec), persistent root shells (shell_open/run/close),"
-        " file operations (read_file, upload, download), and machine inventory"
+        " file operations (read_file, write_file, upload, download), staged"
+        " script execution (run_script), remote tmux terminal control"
+        " (tmux_new/list/capture/wait/paste/send_keys/kill), and machine inventory"
         " (list_machines, add_host, reload_machines)."
         " The 'host' parameter accepts hostname OR IP address."
         " IMPORTANT: Use sudo_exec (not exec) for kubectl, systemctl, and"
         " most system commands - regular users typically lack permissions."
+        " IMPORTANT: Use run_script instead of sudo_exec for heredocs, long"
+        " scripts, tmux launch wrappers, or commands with complex quoting."
     ),
 )
 
@@ -179,11 +183,13 @@ async def sudo_exec(host: str, command: str, timeout: int = 60) -> str:
         return f"ERROR: {e}"
 
 
-def _convert_svg_to_png(svg_path: Path) -> Path:
+def _convert_svg_to_png(svg_path: Path, png_path: Optional[Path] = None) -> Path:
     """Convert an SVG to PNG using rsvg-convert (from librsvg).
 
     Produces a correctly-sized PNG at 1200px width, preserving the SVG's
-    aspect ratio. No padding, no square canvas issues.
+    aspect ratio. If png_path is None, writes alongside the SVG with a
+    .png suffix (used by the GIF frame pipeline). Otherwise writes to
+    png_path (used by _save_png_and_report with a tempfile input).
 
     Raises RuntimeError with an actionable message if rsvg-convert is
     unavailable or the conversion fails.
@@ -194,7 +200,7 @@ def _convert_svg_to_png(svg_path: Path) -> Path:
             "Install with: brew install librsvg"
         )
 
-    clean_png = svg_path.with_suffix(".png")
+    clean_png = png_path if png_path is not None else svg_path.with_suffix(".png")
     result = subprocess.run(
         ["rsvg-convert", "-w", "1200", str(svg_path), "-o", str(clean_png)],
         capture_output=True,
@@ -284,47 +290,43 @@ def _convert_frames_to_gif(
     return output_path
 
 
-def _save_svg_and_report(
+def _save_png_and_report(
     svg: str,
     command: str,
     output_name: Optional[str],
     exit_code: int,
     n_lines: int,
-    fmt: str = "svg",
 ) -> str:
-    """Write an SVG to the guide output dir and return the standard result string.
+    """Render a PNG from an SVG string and return the standard result string.
 
-    If fmt='png', additionally converts the SVG to PNG via qlmanage and returns
-    the PNG path (the SVG is left in place as a secondary artifact for
-    regeneration or other use).
+    The SVG is written to a tempfile (auto-deleted), rsvg-convert produces the
+    PNG in the guide output dir, and the final path is returned. No SVG file
+    is left in the guide dir.
 
     Shared by render_command (live SSH) and render_output (offline/mocked).
     """
     if _guide_output_dir is None:
         return "ERROR: guide output directory not configured"
 
-    if fmt not in ("svg", "png"):
-        return f"ERROR: unknown fmt '{fmt}'; expected 'svg' or 'png'"
-
     if output_name:
-        filename = f"{output_name}.svg"
+        filename = f"{output_name}.png"
     else:
-        filename = f"{_slugify_command(command)}-{int(time.time())}.svg"
+        filename = f"{_slugify_command(command)}-{int(time.time())}.png"
+    png_path = _guide_output_dir / filename
 
-    svg_path = _guide_output_dir / filename
-    try:
-        svg_path.write_text(svg, encoding="utf-8")
-    except OSError as e:
-        return f"ERROR: Cannot write to guide output directory: {svg_path} ({e})"
-
-    final_path = svg_path
-    if fmt == "png":
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".svg", delete=True, encoding="utf-8",
+    ) as tmp:
+        tmp.write(svg)
+        tmp.flush()
         try:
-            final_path = _convert_svg_to_png(svg_path)
+            _convert_svg_to_png(Path(tmp.name), png_path)
         except RuntimeError as e:
             return f"ERROR: {e}"
+        except OSError as e:
+            return f"ERROR: Cannot write PNG to guide output directory: {png_path} ({e})"
 
-    return f"Rendered: {final_path} \n[exit_code: {exit_code}, {n_lines} lines of output]"
+    return f"Rendered: {png_path} \n[exit_code: {exit_code}, {n_lines} lines of output]"
 
 
 def _save_gif_and_report(
@@ -377,11 +379,10 @@ async def render_command(
     timeout: int = 60,
     max_output_lines: int = 200,
     prompt_cwd: str = "~",
-    fmt: str = "svg",
 ) -> str:
-    """Run a command on a remote host and render the output as a polished SVG terminal screenshot.
+    """Run a command on a remote host and render the output as a polished PNG terminal screenshot.
 
-    The SVG is saved to the configured guide output directory and the absolute
+    The PNG is saved to the configured guide output directory and the absolute
     path is returned. Use this for blog posts, tutorials, and documentation -
     the output shown is whatever the command actually printed on the remote machine.
 
@@ -390,6 +391,8 @@ async def render_command(
     Note: with sudo=True (the default), remote stderr is merged into stdout due
     to PTY allocation for sudo password handling. Use sudo=False when you want
     stderr to render in red.
+
+    Requires rsvg-convert (brew install librsvg) for SVG-to-PNG conversion.
 
     Args:
         host: Hostname or IP (case-insensitive)
@@ -403,11 +406,6 @@ async def render_command(
         prompt_cwd: Working directory shown in the prompt (default "~"). Set this
             when the guide implies the operator is in a specific directory, e.g.
             "/opt/onwatch".
-        fmt: Output format - "svg" (default) or "png". PNG output uses macOS
-            qlmanage for conversion (no new Python deps) and is the right choice
-            when you plan to drag the file into Confluence or other tools that
-            handle raster images better than SVG. SVG is left in place alongside
-            the PNG as a secondary artifact.
     """
     m = store.get(host)
     if not m:
@@ -434,8 +432,8 @@ async def render_command(
     )
 
     n_lines = len(result.stdout.splitlines()) + len(result.stderr.splitlines())
-    return _save_svg_and_report(
-        svg, command, output_name, result.exit_code, n_lines, fmt=fmt
+    return _save_png_and_report(
+        svg, command, output_name, result.exit_code, n_lines,
     )
 
 
@@ -452,12 +450,11 @@ async def render_output(
     title: Optional[str] = None,
     output_name: Optional[str] = None,
     max_output_lines: int = 200,
-    fmt: str = "svg",
 ) -> str:
     """Render a terminal screenshot from literal text without running any command.
 
     Unlike render_command, this tool does NO SSH. You supply the command text,
-    stdout, and stderr yourself, and get back an SVG terminal screenshot. Use
+    stdout, and stderr yourself, and get back a PNG terminal screenshot. Use
     this for:
       - Idealized "here's what success looks like" guide screenshots
       - Output you already captured from logs, journalctl, or a previous session
@@ -468,11 +465,13 @@ async def render_output(
     machine record to pull those from. This is the intended "mock a screenshot"
     tool for guide authors.
 
+    Requires rsvg-convert (brew install librsvg) for SVG-to-PNG conversion.
+
     Args:
         command: Command text to show on the prompt line
         stdout: Literal stdout text to render (may be empty)
         stderr: Literal stderr text to render in red (may be empty)
-        exit_code: Shown in the result summary; does not affect the SVG
+        exit_code: Shown in the result summary; does not affect rendering
         prompt_user: Username shown in the prompt (default "user")
         prompt_host: Hostname shown in the prompt (default "host")
         prompt_cwd: Working directory shown in the prompt (default "~")
@@ -480,10 +479,6 @@ async def render_output(
         title: Optional title bar text; default "prompt_user@prompt_host: ~"
         output_name: Optional filename stem (no extension); default is slugified command + timestamp
         max_output_lines: Max output lines to render before truncation (default 200)
-        fmt: Output format - "svg" (default) or "png". PNG output uses macOS
-            qlmanage for conversion (no new Python deps) and is the right choice
-            when you plan to drag the file into Confluence or other tools that
-            handle raster images better than SVG.
     """
     opts = RenderOptions(
         prompt_user=prompt_user,
@@ -496,8 +491,8 @@ async def render_output(
     svg = render_terminal_svg(command, stdout, stderr, exit_code, opts)
 
     n_lines = len(stdout.splitlines()) + len(stderr.splitlines())
-    return _save_svg_and_report(
-        svg, command, output_name, exit_code, n_lines, fmt=fmt
+    return _save_png_and_report(
+        svg, command, output_name, exit_code, n_lines,
     )
 
 
@@ -685,6 +680,51 @@ async def read_file(host: str, remote_path: str, max_bytes: int = 1048576) -> st
 
 
 @mcp_server.tool()
+async def write_file(host: str, remote_path: str, content: str,
+                     sudo: bool = False, mode: str = "0644",
+                     owner: str = "", timeout: int = 60) -> str:
+    """Write text content to a remote file without shell heredocs.
+
+    This is the safe MCP-compatible way to create remote files from Claude Code
+    or Codex. The content is transferred through SFTP. With sudo=true, content
+    is staged under /tmp and installed into place with a short root command, so
+    the file body is not embedded in a fragile shell string.
+
+    Args:
+        host: Hostname or IP of the target machine (case-insensitive)
+        remote_path: Absolute path to write on the remote machine
+        content: UTF-8 text content to write
+        sudo: Install as root after SFTP staging (default false)
+        mode: Octal file mode such as 0644, 0600, or 0755
+        owner: Optional owner or owner:group, requires sudo=true
+        timeout: Seconds before timeout for the sudo install step
+    """
+    m = store.get(host)
+    if not m:
+        return (
+            f"ERROR: Machine '{host}' not found."
+            " Use list_machines to see available machines."
+        )
+    try:
+        size = await pool.write_file(
+            m,
+            remote_path,
+            content,
+            sudo=sudo,
+            mode=mode,
+            owner=owner or None,
+            timeout=timeout,
+        )
+        return f"Wrote {size:,} bytes to {host}:{remote_path}"
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except PermissionError:
+        return f"ERROR: Permission denied writing to {remote_path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
 async def upload(host: str, local_path: str, remote_path: str) -> str:
     """Upload a local file to a remote machine via SFTP.
 
@@ -729,6 +769,322 @@ async def download(host: str, remote_path: str, local_path: str) -> str:
         return f"ERROR: {e}"
     except FileNotFoundError:
         return f"ERROR: Remote file not found: {remote_path}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def _format_run_script_result(host: str, script_result) -> str:
+    """Format staged script output for MCP clients without dumping metadata noise."""
+    result = script_result.result
+    if script_result.tmux_session:
+        if result.exit_code != 0 or result.error:
+            return result.format()
+
+        lines = [
+            (
+                f"Launched script in tmux session "
+                f"'{script_result.tmux_session}' on {host}."
+            ),
+        ]
+        if script_result.log_path:
+            lines.extend([
+                f"log_path: {script_result.log_path}",
+                f"follow_log: tail -f {script_result.log_path}",
+            ])
+        lines.append(f"attach: tmux attach -t {script_result.tmux_session}")
+        if script_result.kept:
+            lines.extend([
+                f"script_path: {script_result.script_path}",
+                f"runner_path: {script_result.runner_path}",
+            ])
+        return "\n".join(lines)
+
+    lines = [result.format()]
+    if script_result.log_path:
+        lines.append(f"log_path: {script_result.log_path}")
+    if script_result.kept:
+        lines.extend([
+            f"script_path: {script_result.script_path}",
+            f"runner_path: {script_result.runner_path}",
+        ])
+    return "\n".join(lines)
+
+
+@mcp_server.tool()
+async def run_script(host: str, script: str, sudo: bool = True,
+                     timeout: int = 60, tmux_session: Optional[str] = None,
+                     log_path: Optional[str] = None, env: Optional[dict] = None,
+                     keep_script: bool = False) -> str:
+    """Stage and run a bash script on a remote machine.
+
+    Use this instead of exec/sudo_exec for heredocs, multi-line scripts, tmux
+    launch wrappers, installers, or commands with complex quoting. The script
+    body and small runner are transferred through SFTP, then ssh-fleet executes
+    only a short command. This avoids JSON/string/newline escaping failures in
+    Claude Code and other MCP clients.
+
+    Args:
+        host: Hostname or IP of the target machine (case-insensitive)
+        script: Bash script content to stage and run
+        sudo: Run as root through sudo (default true)
+        timeout: Seconds before timeout for synchronous runs or tmux launch
+        tmux_session: Optional tmux session name. If set, launch and return.
+        log_path: Optional absolute path for tee'd output and EXIT marker
+        env: Optional JSON object of environment variables for the script
+        keep_script: Keep staged files after completion. If env contains
+            secrets, leave this false.
+    """
+    m = store.get(host)
+    if not m:
+        return (
+            f"ERROR: Machine '{host}' not found."
+            " Use list_machines to see available machines."
+        )
+    if env is not None and not isinstance(env, dict):
+        return "ERROR: env must be a JSON object of KEY: value pairs"
+
+    try:
+        result = await pool.run_script(
+            m,
+            script,
+            sudo=sudo,
+            timeout=timeout,
+            tmux_session=tmux_session or None,
+            log_path=log_path or None,
+            env=env,
+            keep_script=keep_script,
+        )
+        return _format_run_script_result(host, result)
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+def _machine_or_error(host: str):
+    m = store.get(host)
+    if not m:
+        return None, (
+            f"ERROR: Machine '{host}' not found."
+            " Use list_machines to see available machines."
+        )
+    return m, ""
+
+
+@mcp_server.tool()
+async def tmux_new(host: str, session: str, command: str = "",
+                   cwd: str = "", sudo: bool = True,
+                   timeout: int = 30) -> str:
+    """Create a detached tmux session on a remote machine.
+
+    Use this when an agent needs a durable remote terminal it can control over
+    multiple MCP calls. Start an empty shell by leaving command blank, or start
+    a command like "bash" or "top". Follow with tmux_capture, tmux_paste, and
+    tmux_send_keys.
+
+    Args:
+        host: Hostname or IP of the target machine
+        session: tmux session name, letters/numbers/._:- only
+        command: Optional command to run in the session
+        cwd: Optional absolute working directory for the session
+        sudo: Create the tmux session as root via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_new(
+            m, session, command=command, cwd=cwd, sudo=sudo, timeout=timeout
+        )
+        if result.exit_code == 0:
+            return f"Started tmux session '{session}' on {host}."
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_list(host: str, sudo: bool = True, timeout: int = 20) -> str:
+    """List tmux sessions on a remote machine.
+
+    Output columns are: session name, window count, attached count, created time.
+    Args:
+        host: Hostname or IP of the target machine
+        sudo: List root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_list(m, sudo=sudo, timeout=timeout)
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_capture(host: str, target: str, lines: int = 200,
+                       sudo: bool = True, timeout: int = 20) -> str:
+    """Capture recent output from a remote tmux pane.
+
+    Use this as the main observation tool after tmux_new, tmux_paste, or
+    tmux_send_keys. Target can be a session, session:window.pane, or %pane id.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux target such as session, session:0.0, or %1
+        lines: Number of recent lines to capture
+        sudo: Capture root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_capture(
+            m, target, lines=lines, sudo=sudo, timeout=timeout
+        )
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_wait(host: str, target: str, pattern: str,
+                    regex: bool = False, timeout: int = 60,
+                    interval: float = 1.0, lines: int = 200,
+                    sudo: bool = True) -> str:
+    """Wait until text appears in a remote tmux pane.
+
+    Use this after tmux_paste or tmux_send_keys when an agent needs to wait for
+    a prompt, completion message, menu, or error before deciding the next step.
+    Returns the latest captured pane output with MATCHED or TIMEOUT status.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux target such as session, session:0.0, or %1
+        pattern: Literal text or regex to wait for
+        regex: Treat pattern as a Python regex instead of literal text
+        timeout: Maximum seconds to wait
+        interval: Seconds between captures
+        lines: Number of recent lines to capture each poll
+        sudo: Capture root-owned tmux sessions via sudo (default true)
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_wait(
+            m,
+            target,
+            pattern,
+            regex=regex,
+            timeout=timeout,
+            interval=interval,
+            lines=lines,
+            sudo=sudo,
+        )
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_paste(host: str, target: str, text: str,
+                     enter: bool = False, sudo: bool = True,
+                     timeout: int = 20) -> str:
+    """Paste arbitrary text into a remote tmux pane.
+
+    Text is staged through SFTP as a tmux buffer, so quotes, dollar signs,
+    heredocs, and multiline commands are not embedded in the SSH command.
+    Set enter=true to send Enter after the paste.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux target such as session, session:0.0, or %1
+        text: Text to paste into the pane
+        enter: Send Enter after pasting (default false)
+        sudo: Paste into root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_paste(
+            m, target, text, enter=enter, sudo=sudo, timeout=timeout
+        )
+        if result.exit_code == 0:
+            return f"Pasted {len(text)} characters to tmux target '{target}' on {host}."
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_send_keys(host: str, target: str, keys: str,
+                         sudo: bool = True, timeout: int = 20) -> str:
+    """Send tmux key tokens to a remote pane.
+
+    Use this for controls like C-c, Enter, Up, Down, or C-m. For normal text,
+    especially text with spaces or shell metacharacters, use tmux_paste.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux target such as session, session:0.0, or %1
+        keys: Whitespace-separated tmux key tokens, for example "C-c" or "Enter"
+        sudo: Send keys to root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_send_keys(
+            m, target, keys, sudo=sudo, timeout=timeout
+        )
+        if result.exit_code == 0:
+            return f"Sent keys to tmux target '{target}' on {host}: {keys}"
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
+@mcp_server.tool()
+async def tmux_kill(host: str, target: str,
+                    sudo: bool = True, timeout: int = 20) -> str:
+    """Kill a remote tmux session.
+
+    Args:
+        host: Hostname or IP of the target machine
+        target: tmux session target to kill
+        sudo: Kill root-owned tmux sessions via sudo (default true)
+        timeout: Seconds before timeout
+    """
+    m, error = _machine_or_error(host)
+    if error:
+        return error
+    try:
+        result = await pool.tmux_kill(m, target, sudo=sudo, timeout=timeout)
+        if result.exit_code == 0:
+            return f"Killed tmux target '{target}' on {host}."
+        return result.format()
+    except SSHConnectionError as e:
+        return f"ERROR: {e}"
     except Exception as e:
         return f"ERROR: {e}"
 
@@ -802,27 +1158,33 @@ async def shell_list() -> str:
 @mcp_server.tool()
 async def add_host(hostname: str, ip: str, username: str,
                    password: str = "", key_file: str = "",
-                   permanent: bool = False) -> str:
-    """Add a machine to the fleet. Permanent saves to the hosts file for future sessions.
+                   permanent: bool = True,
+                   overwrite: bool = False) -> str:
+    """Add a machine to the fleet. Defaults to permanent (saved to the hosts file).
 
     The machine is available immediately for exec/sudo_exec.
-    With permanent=False (default), it's session-only and gone when the session ends.
-    With permanent=True, it's appended to the hosts file and persists across sessions.
+    With permanent=True (default), it's appended to the hosts file and persists across sessions.
+    Pass permanent=False for a session-only entry (required when using key_file auth).
+    Pass overwrite=True to replace any existing permanent row with the same hostname or IP
+    (useful when the same IP is reused for a different physical machine).
 
     Args:
         hostname: Name for this machine
         ip: IP address
         username: SSH username
         password: SSH password (required for permanent; optional if using key_file for temp)
-        key_file: Path to SSH private key (only for temporary machines)
-        permanent: Save to hosts file for future sessions (default false)
+        key_file: Path to SSH private key (only for temporary machines; pass permanent=False)
+        permanent: Save to hosts file for future sessions (default true)
+        overwrite: Replace existing rows matching this hostname or IP (permanent only, default false)
     """
     try:
         if permanent:
             m = store.add_permanent(
-                hostname, ip, username, password=password, auth_file=_auth_file
+                hostname, ip, username, password=password,
+                auth_file=_auth_file, overwrite=overwrite,
             )
-            return f"Added '{hostname}' ({ip}) permanently to {_auth_file}. Ready for exec/sudo_exec."
+            suffix = " (replaced existing entry)" if overwrite else ""
+            return f"Added '{hostname}' ({ip}) permanently to {_auth_file}{suffix}. Ready for exec/sudo_exec."
         else:
             store.add_temporary(hostname, ip, username, password=password, key_file=key_file)
             auth_method = "key" if key_file else "password"
